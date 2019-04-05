@@ -1,0 +1,631 @@
+import { Injectable } from '@angular/core';
+import { DbWrapperService, DBTable } from 'db-wrapper';
+import { SqlTransaction, SqlResultSet,SqlStatement, DataToSync, SqlError,
+  SyncInfo, SyncResult, TableToSync } from './dantia-sync-cli.models';
+
+
+@Injectable()
+export class DantiaSyncCliService {
+  private db: any;
+  private tablesToSync: TableToSync[]  = [];
+  private idNameFromTableName = {};
+  private sizeMax: number = 1048576;
+  private firstSync: boolean;
+  private firstSyncDate: number = 0;
+  private clientData;
+  private serverData;
+  private syncDate: number;
+  public syncInfo: SyncInfo;
+  public syncResult: SyncResult;
+
+  constructor(db: DbWrapperService) {
+    this.db = db.db;
+    console.log('sync activo.');
+    this.init();
+  }
+
+  init() {
+    let stat:SqlStatement[] =  [];
+    console.log('init');
+    this.db.schema.tables.forEach((table: DBTable) => {
+      if (table.sync) {
+        this.tablesToSync.push({tableName: table.name, idName: table.sync});
+        this.idNameFromTableName[table.name] = table.sync;
+      }
+    });
+
+
+    this._executeSql('CREATE TABLE IF NOT EXISTS new_elem (table_name TEXT NOT NULL, id TEXT NOT NULL, ' +
+        'change_time TIMESTAMP NOT NULL DEFAULT  (strftime(\'%s\',\'now\')));');
+    this._executeSql('CREATE INDEX IF NOT EXISTS index_tableName_newElem on new_elem (table_name)');
+    this._executeSql('CREATE TABLE IF NOT EXISTS delete_elem (table_name TEXT NOT NULL, id TEXT NOT NULL, ' +
+        'change_time TIMESTAMP NOT NULL DEFAULT  (strftime(\'%s\',\'now\')));');
+    this._executeSql('CREATE INDEX IF NOT EXISTS index_tableName_deleteElem on delete_elem (table_name)');
+    this._executeSql('CREATE TABLE IF NOT EXISTS sync_info (last_sync TIMESTAMP);');
+
+    // create triggers to automatically fill the new_elem table (this table will contains a pointer to all the modified data)
+    this.tablesToSync.forEach(curr => {
+      this._executeSql('CREATE TRIGGER IF NOT EXISTS update_' + curr.tableName + '  AFTER UPDATE ON ' + curr.tableName + ' ' +
+                'WHEN (SELECT last_sync FROM sync_info) > 0 ' +
+                'BEGIN INSERT INTO new_elem (table_name, id) VALUES ' +
+                '("' + curr.tableName + '", new.' + curr.idName + '); END;');
+
+      this._executeSql('CREATE TRIGGER IF NOT EXISTS insert_' + curr.tableName + '  AFTER INSERT ON ' + curr.tableName + ' ' +
+                'WHEN (SELECT last_sync FROM sync_info) > 0 ' +
+                'BEGIN INSERT INTO new_elem (table_name, id) VALUES ' +
+                '("' + curr.tableName + '", new.' + curr.idName + '); END;');
+
+      this._executeSql('CREATE TRIGGER IF NOT EXISTS delete_' + curr.tableName + '  AFTER DELETE ON ' + curr.tableName + ' ' +
+                'BEGIN INSERT INTO delete_elem (table_name, id) VALUES ' +
+                '("' + curr.tableName + '", old.' + curr.idName + '); END;');
+    });
+    this._selectSql('SELECT last_sync FROM sync_info').then(res => {
+      if (res.length === 0 || res[0] === 0) { // First sync (or data lost)
+        if (res.length === 0) {
+          this._executeSql('INSERT OR REPLACE INTO sync_info (last_sync) VALUES (0)', []);
+        }
+        this.firstSync = true;
+        this.syncInfo.lastSyncDate = 0;
+      } else {
+        this.syncInfo.lastSyncDate = res[0];
+        if (this.syncInfo.lastSyncDate === 0) {
+            this.firstSync = true;
+        }
+      }
+    });
+  }
+
+  initSync(syncInfo: SyncInfo) {
+    this.syncInfo = syncInfo;
+    if (!syncInfo.sizeMax) { this.syncInfo.sizeMax = this.sizeMax; }
+  }
+
+  isRunning(): boolean {
+    if (this.syncResult !== null) {
+        return true;
+    } else {
+        return false;
+    }
+  }
+
+  isPending(): Promise<boolean> {
+    if (this.isRunning()) {
+      return new Promise(resolve => {
+        setTimeout(() => { return true; }, 500);
+      });
+    } else {
+      let pendientes =
+        [
+          this._selectSql('select count(*) from delete_elem'),
+          this._selectSql('select count(*) from new_elem')
+        ];
+      return Promise.all(pendientes).then( (pdte: boolean[][]) => {
+        if (pdte[0][0] || pdte[1][0]) { return true; } else { return false; }
+      });
+    }
+  }
+
+  getLastSyncdate(): number {
+    return this.syncInfo.lastSyncDate;
+  }
+
+  setSyncDate(val: number) {
+    this.syncInfo.lastSyncDate = val;
+    this._executeSql('UPDATE sync_info SET last_sync = '+this.syncInfo.lastSyncDate, []);
+  }
+
+  setFirstSync() {
+    this.firstSync = true;
+    this.syncInfo.lastSyncDate = 0;
+    this._executeSql('UPDATE sync_info SET last_sync = '+this.syncInfo.lastSyncDate, []);
+  }
+
+  log(message) {
+    console.log(message);
+  }
+
+  logSql(message) {
+    console.log(message);
+  }
+
+  error(message) {
+    console.error(message);
+  }
+
+  /******* PRIVATE FUNCTIONS  ******************/
+
+  private _getDataToBackup(modelsToBck: string[]): Promise<DataToSync> {
+    let nbData = 0;
+    this.log('_getDataToBackup');
+    let dataToSync: DataToSync = {
+        info: this.syncInfo,
+        data: {},
+        delete_elem: {}
+    };
+    let sentences: Promise<Object[]>[];
+
+    modelsToBck.forEach((tableName: string) => { // a simple for will not work here because we have an asynchronous call inside
+        let currTable: TableToSync = this._getTableToProcess(tableName);
+        sentences.push(this._getDataToSavDel(currTable.tableName, currTable.idName, this.firstSync));
+    }); // end for each
+    return Promise.all<Object[]>(sentences)
+    .then( datas => {
+      datas.forEach((data, ix) => {
+        dataToSync.data[modelsToBck[ix]] = data;
+        nbData += data.length;
+      });
+      this.log('Data fetched from the local DB');
+      this.syncResult.nbSent += nbData;
+      return dataToSync;
+    });
+  }
+
+  private _finishSync(syncDate: number): Promise<any> {
+    let sentences=[];
+    this.firstSync = false;
+    if (this.firstSyncDate !== 0) {
+        this.syncInfo.lastSyncDate = this.firstSyncDate;
+        this._executeSql(`UPDATE sync_info SET last_sync = ${this.firstSyncDate}`, []);
+    } else {
+        this.syncInfo.lastSyncDate = syncDate;
+        this._executeSql(`UPDATE sync_info SET last_sync = ${syncDate}`, []);
+    }
+    // Remove only the elem sent to the server (in case new_elem has been added during the sync)
+    // We don't do that anymore: this._executeSql('DELETE FROM new_elem', [], tx);
+    for (let tableName in this.clientData.data) {
+        let idsNewToDelete = [];
+        let idsDelToDelete = [];
+        let idsString = '';
+        let idName =  this.idNameFromTableName[tableName];
+        this.clientData.data[tableName].forEach(reg => {
+            if (reg.TipoOper == 'U')
+                idsNewToDelete.push('"'+reg[idName]+'"');
+            else
+                idsDelToDelete.push('"'+reg.IdOper+'"');
+        });
+        if (idsNewToDelete.length > 0) {
+            idsString = idsNewToDelete.map(x => '?').join(',');
+            sentences.push(
+              this._executeSql(`DELETE FROM new_elem WHERE table_name ='${tableName}'
+                 AND id IN (${idsString})
+                 AND change_time <= ${this.syncDate}`, []));
+        }
+
+        if (idsDelToDelete.length > 0) {
+            idsString = idsDelToDelete.map(x => '?').join(',');
+            sentences.push(
+              this._executeSql(`DELETE FROM delete_elem WHERE table_name = '${tableName}'
+                 AND id IN (${idsString})
+                 AND change_time <= ${this.syncDate}`, []));
+        }
+    }
+    // Remove elem sent to server for delete
+    for (let tableName in this.clientData.delete_elem) {
+      sentences.push(
+        this._executeSql(`DELETE FROM delete_elem WHERE  table_name = '${tableName}'
+          AND  change_time <= ${this.syncDate}`,[]));
+    }
+
+    return Promise.all(sentences).then( () => {
+      // Remove delete_elem
+      if (this.serverData.data.delete_elem) {
+        delete this.serverData.data.delete_elem;
+      }
+
+      this.clientData = null;
+      this.serverData = null;
+    });
+  }
+
+  private _getTableToProcess(tableName: string): TableToSync {
+    let result = null;
+    this.tablesToSync.forEach( table => {
+        if (table.tableName === tableName) {
+            result = table;
+        }
+    });
+    if (!result) {
+      this.error(tableName + ' no se encuentra entre las tablas a sincronizar.');
+    }
+    return result;
+  }
+
+  private _getDataToSavDel(tableName: string, idName: string, needAllData: boolean): Promise<Object[] | any[]> {
+    const sql = 'select distinct op.TipoOper, op.IdOper , c.* ' +
+        'from ( ' +
+        'select id IdOper, "U" TipoOper, change_time ' +
+        'from new_elem ' +
+        'where table_name= ? AND change_time <= ? ' +
+        ' union ALL ' +
+        'select id IdOper, "D" TipoOper, change_time ' +
+        'from delete_elem ' +
+        'where table_name= ? AND change_time <= ? '+
+        ' order by change_time) op ' +
+        'left join ' + tableName + ' c on c.idsync = op.IdOper ' +
+        'where (TipoOper="U" and idsync is not null) or TipoOper="D" ' +
+        'order by change_time, TipoOper';
+
+    return this._selectSql(sql, [tableName, this.syncDate, tableName, this.syncDate]);
+  }
+
+  private _getDataToDelete(tableName: string): Promise<Object[] | any[]> {
+    const sql = 'select distinct id FROM delete_elem' +
+        ' WHERE table_name = ? AND change_time <= ?' +
+        ' ORDER BY change_time ';
+    return this._selectSql(sql, [tableName, this.syncDate]);
+  }
+
+  private _detectConflict(tableName: string, idValue: any): Promise<boolean> {
+    let sql;
+    if (!this.firstSync) {
+        sql = 'select DISTINCT id FROM new_elem ' +
+              ' WHERE table_name = ?  AND id = ? AND change_time > ? ' +
+              ' UNION ALL ' +
+              'select DISTINCT id FROM delete_elem ' +
+              ' WHERE table_name = ? AND id = ? AND change_time > ?';
+
+        return this._selectSql(sql, [tableName, idValue, this.syncDate, tableName, idValue, this.syncDate])
+        .then(exists =>{
+            if (exists.length) {
+                return true;
+            } else {
+                return false;
+            }
+        });
+    } else {
+      return new Promise<boolean> (resolve => {
+        setTimeout(() => {  return false; },100);
+      })
+    }
+  }
+
+  private _updateRecord(tableName: string, idName: string, reg:Object) {
+    let sql;
+
+    return this._detectConflict(tableName,reg[idName]).then ( exists => {
+        if (!exists) {
+            /*ex : UPDATE "tableName" SET colonne 1 = [valeur 1], colonne 2 = [valeur 2]*/
+            let attList = this._getAttributesList(reg);
+            sql = this._buildUpdateSQL(tableName, reg);
+            sql += ' WHERE ' + idName + ' = ? ';
+            let attValue = this._getMembersValue(reg, attList);
+
+            return this._executeSql(sql, [ ...attValue, reg[idName]]).then (() => {
+                let sql = 'DELETE FROM new_elem WHERE ' +
+                    'table_name = ? AND id = ? AND ' +
+                    'change_time = (select MAX(change_time) FROM new_elem  ' +
+                    'WHERE table_name = ?  AND id = ?) ';
+
+                return this._executeSql(sql, [tableName, reg[idName], tableName, reg[idName] ]);
+            });
+
+        } else {  // send conflict to server
+            return this._sendConflict(tableName,idName,reg);
+        }
+    });
+  }
+
+  private _updateFirstLocalDb(serverData) {
+    this.serverData = serverData;
+
+    if (typeof serverData.data === 'undefined' || serverData.data.length === 0) {
+        //nothing to update
+        //We only use the server date to avoid dealing with wrong date from the client
+        return this._finishSync(serverData.syncDate);
+    }
+    let counterNbTable = 0, nbTables = serverData.models.completado.length;
+    let counterNbElm = 0;
+
+    serverData.models.completado.forEach(tableName => {
+        let stat = [];
+        let table = this._getTableToProcess(tableName);
+        let currData = serverData.data[table.tableName];
+        if (!currData) {
+            //Should always be defined (even if 0 elements)
+            //Must not be null
+            currData = [];
+        }
+        let nb = currData.length;
+        counterNbElm += nb;
+        this.log('There are ' + nb + ' new elements, in the table ' + table.tableName + ' to save in the local DB');
+
+        let counterNbElmTab = 0;
+
+        if (nb === 0) {
+          stat.push(Promise.resolve());
+        } else {
+          for (let i = 0, curr = null; i < nb; i++) {
+            curr = serverData.data[table.tableName][i];
+            stat.push(this._insertRecord(table.tableName,table.idName,curr) );
+          }
+        }
+        Promise.all(stat).then( () => {
+          counterNbTable++;
+          this.log(table.tableName + ' percent: ' + (Math.round(counterNbTable / nbTables * 100)).toString());
+          //callBackProgress(table.tableName, (Math.round(counterNbTable / nbTables * 100)).toString(), 'updateLocalDB');
+          if (counterNbTable === nbTables) {
+              //TODO set counterNbElm to info
+              this.syncResult.nbUpdated += counterNbElm;
+              this._finishSync(serverData.syncDate);
+                  if (!serverData.models.pendiente.length)
+                    console.log('callback()'); // callBack();
+                  else
+                    return this._syncNowGo(serverData.models.pendiente, false);
+          }
+        })
+        .catch( err => {
+          this._errorHandler(err);
+        });
+    });//end forEach
+  }
+
+  private _insertRecord(tableName: string, idName: string, reg:Object, tx: SqlTransaction) {
+    let sql;
+
+    return this._detectConflict(tableName,reg[idName],tx).then (exists => {
+        if (!exists) {
+
+            //'ex INSERT INTO tablename (id, name, type, etc) VALUES (?, ?, ?, ?);'
+            let attList = this._getAttributesList(reg);
+            sql = this._buildInsertSQL(tableName, reg);
+            let attValue = this._getMembersValue(reg, attList);
+            if (!this.firstSync) {
+                return this._executeSql(sql, attValue, tx).then( () => {
+                    sql = 'DELETE FROM new_elem WHERE ' +
+                        'table_name = "' + tableName + '" AND ' +
+                        'id = "' + reg[idName] + '" AND ' +
+                        'change_time = (select MAX(change_time) FROM new_elem WHERE ' +
+                        'table_name = "' + tableName + '" AND ' +
+                        'id = "' + reg[idName] + '") ';
+
+                    return this._executeSql(sql,[],tx);
+                });
+            } else {
+                return this._executeSql(sql, attValue);
+            }
+
+        } else {  // send conflict to server
+            return this._sendConflict(tableName,idName,reg, tx);
+        }
+    });
+  }
+
+  private _transformRs(rs: SqlResultSet): Object[] {
+    let elms = [];
+    if (typeof rs.rows === 'undefined') {
+        return elms;
+    }
+
+    for (let i = 0, ObjKeys; i < rs.rows.length; ++i) {
+        ObjKeys = Object.keys(rs.rows.item(i));
+        if (ObjKeys.length === 1 ) {
+            elms.push(rs.rows.item(i)[ ObjKeys[0] ] );
+        } else {
+            elms.push(rs.rows.item(i));
+        }
+    }
+    return elms;
+  }
+
+  private _deleteTableLocalDb(tablename: string, idName: string, listIdToDelete: any[], tx: SqlTransaction): Promise<any> {
+    let sentences:Promise<SqlResultSet>[],
+      sql = 'delete from ' + tablename + ' WHERE ' + idName +
+        ' IN (' + listIdToDelete.map(x => '?').join(',')  + ')';
+    sentences.push( this._executeSql(sql, listIdToDelete, tx) );
+    sql = 'delete from delete_elem WHERE table_name = "' + tablename +
+            '" and id ' +
+            ' IN (' + listIdToDelete.map(x => '?').join(',') + ')';
+    sentences.push( this._executeSql(sql, listIdToDelete, tx) );
+
+    return Promise.all(sentences);
+  }
+
+  private _getIdExitingInDB(tableName: string, idName: string, listIdToCheck: any[], tx: SqlTransaction): Promise<boolean[]> {
+    if (listIdToCheck.length === 0) {
+      return new Promise (resolve => { setTimeout(() =>{ return []; }); });
+    } else {
+      let sql = `select ${idName} FROM ${tableName} WHERE ${idName} IN ( ${listIdToCheck.map(x => '?').join(',')} )`;
+      return this._selectSql(sql, tx).then ((idsFind:any[]) => {
+          let idsInDb = [];
+          idsFind.forEach(id => { idsInDb[id] = true; } );
+          return idsInDb;
+      });
+    }
+  }
+/*
+  private _batch (execSql:SqlStatement[]): Promise<SqlResultSet[]> {
+    let result: SqlResultSet[] = [];
+    return new Promise ((resolve, reject) => {
+      this.db.transaction ( tx => {
+        execSql.some((stat:SqlStatement) => {
+          return this._executeSql(stat.sql, stat.params || [],tx).then ( rs => {
+            result.push(rs);
+            if (stat.successCallback) {
+              stat.successCallback(rs);
+            }
+            return false;
+          }, (error) => {
+            if (stat.errorCallback) {
+              stat.errorCallback(error);
+            }
+            return true;
+          });
+        });
+      }, error => {
+        reject(error);
+      }, () => {
+        resolve(result);
+      });
+    });
+  }
+
+  private _batchSql  (execSql:SqlStatement[]): Promise<any[]> {
+    let result: any[] = [];
+    return new Promise ((resolve, reject) => {
+      this.db.readTransaction ( tx => {
+        execSql.some((stat) => {
+          this._selectSql(stat.sql, stat.params || [], tx).then( (rs) => {
+            result.push(rs);
+            if (stat.successCallback) {
+              stat.successCallback(rs);
+            }
+          }, (ts, error) => {
+            if (stat.errorCallback) {
+              stat.errorCallback(error);
+            }
+            return true;
+          });
+        });
+      }, error => {
+        reject(error);
+      }, () => {
+        resolve(result);
+      });
+    });
+  }
+*/
+  private _executeSqlBridge (tx: SqlTransaction, sql: string, params: any[], dataHandler, errorHandler) {
+    // Standard WebSQL
+    tx.executeSql(sql, params, dataHandler,
+      (transaction: SqlTransaction, error: SqlError) => {
+            this.log('sql error: ' + sql);
+            errorHandler(transaction, error);
+        }
+    );
+  }
+
+  private _executeSql(sql: string, params?: any[], optionalTransaction?: SqlTransaction): Promise<SqlResultSet> {
+
+    this.logSql('_executeSql: ' + sql + ' with param ' + params);
+    return new Promise((resolve, reject) => {
+      if (optionalTransaction) {
+        this._executeSqlBridge(optionalTransaction, sql, params || [], (tx,rs) => { resolve(rs); }, (err) => { reject(err); } );
+      } else {
+        if (sql.indexOf('select') === 0) {
+          this.db.readTransaction((tx: SqlTransaction) => {
+              this._executeSqlBridge(tx, sql, params,  (tx, rs) => { resolve(rs); }, (err) => { reject(err); });
+          });
+        } else {
+          this.db.transaction((tx: SqlTransaction) => {
+            this._executeSqlBridge(tx, sql, params,  (tx, rs) => { resolve(rs); }, (err) => { reject(err); });
+          });
+        }
+      }
+    });
+  }
+
+
+  private _defaultCallBack(transaction: SqlTransaction, results: SqlResultSet) {
+  //DBSYNC.log('SQL Query executed. insertId: '+results.insertId+' rows.length '+results.rows.length);
+  }
+
+  private _selectSql(sql:string, params?:any[], optionalTransaction?: SqlTransaction): Promise<Object[] | any[]> {
+    return this._executeSql(sql, params, optionalTransaction)
+      .then((rs: SqlResultSet) => {
+          return this._transformRs(rs);
+      });
+  }
+
+  private _errorHandler(transaction: SqlTransaction, error: SqlError) {
+    this.log(error);
+    this.error('Error : ' + error.message + ' (Code ' + error.code + ')' );
+  }
+
+  private _buildInsertSQL(tableName: string, objToInsert: Object): string {
+    let members = this._getAttributesList(objToInsert);
+    if (members.length === 0) {
+        throw 'buildInsertSQL : Error, try to insert an empty object in the table ' + tableName;
+    }
+    //build INSERT INTO myTable (attName1, attName2) VALUES (?, ?) -> need to pass the values in parameters
+    let sql = 'INSERT INTO ' + tableName + ' (';
+    sql += members.join(',');
+    sql += ') VALUES (';
+    sql += members.map(x => '?').join(',');
+    sql += ')';
+    return sql;
+  }
+
+  private _buildUpdateSQL(tableName: string, objToUpdate: Object): string {
+  /*ex UPDATE "nom de table" SET colonne 1 = [valeur 1], colonne 2 = [valeur 2] WHERE {condition}*/
+    let sql = 'UPDATE ' + tableName + ' SET ';
+    let members = this._getAttributesList(objToUpdate);
+    if (members.length === 0) {
+        throw 'buildUpdateSQL : Error, try to insert an empty object in the table ' + tableName;
+    }
+    //let values = this._getMembersValue(objToUpdate, members);
+
+    let nb = members.length;
+    for (let i = 0; i < nb; i++) {
+        sql += '"' + members[i] + '" = ?';
+        if (i < nb - 1) {
+            sql += ', ';
+        }
+    }
+
+    return sql;
+  }
+
+  private _replaceAll(value: any, search: string, replacement: string): string {
+    if (typeof value === 'string') {
+        return value.split(search).join(replacement);
+    } else {
+        return value;
+    }
+  }
+
+  private _replaceQuoted(value: string) {
+    return this._replaceAll(value,'"','""');
+  }
+
+  private _getMembersValue(obj: Object, members): any[] {
+    let memberArray = [];
+    for (let i = 0; i < members.length; i++) {
+        memberArray.push(obj[members[i]]);
+    }
+    return memberArray;
+  }
+
+  private _getAttributesList(obj: Object, check?: any): any[] {
+    let memberArray = [];
+    for (let elm in obj) {
+        if (check && typeof this[elm] === 'function' && !obj.hasOwnProperty(elm)) {
+            continue;
+        }
+        memberArray.push(elm);
+    }
+    return memberArray;
+  }
+
+  private _getMembersValueString(obj, members, separator): string {
+    let result = '';
+    for (let i = 0; i < members.length; i++) {
+        result += '"' + obj[members[i]] + '"';
+        if (i < members.length - 1) {
+            result += separator;
+        }
+    }
+    return result;
+  }
+
+  private  httpGet(url) {
+    return new Promise(
+        function (resolve, reject) {
+            var request = new XMLHttpRequest();
+            request.onreadystatechange = function () {
+                if (this.status === 200) {
+                    // Success
+                    resolve(this.response);
+                } else {
+                    // Something went wrong (404 etc.)
+                    reject(new Error(this.statusText));
+                }
+            }
+            request.onerror = function () {
+                reject(new Error(
+                    'XMLHttpRequest Error: '+this.statusText));
+            };
+            request.open('GET', url);
+            request.send();    
+        });
+  }
+}
