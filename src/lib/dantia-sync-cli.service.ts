@@ -391,8 +391,8 @@ export class DantiaSyncCliService {
           }
         }
       }
-    }, (ts: SqlTransaction, err: SqlError) => {
-      this._errorHandler(ts, err);
+    }, (err: SqlError) => {
+      this._errorHandler(undefined, err);
       this.clientData = null;
       this.serverData = null;
       callBack();
@@ -552,11 +552,11 @@ export class DantiaSyncCliService {
             }); // end getExisting Id
           }
         }); // end delete elements
-      }, (ts, err) => {
+      }, (err) => {
         counterNbTable++;
         sqlErrs.push(err);
         this.log(`TransactionError: ${err.message}`);
-        this._errorHandler(ts, err);
+        this._errorHandler(undefined, err);
         if (counterNbTable === nbTables) {  callBack(sqlErrs);   }
       }, () => {
         counterNbTable++;
@@ -611,11 +611,11 @@ export class DantiaSyncCliService {
               });
             }
           }
-        }, (ts, err) => {
+        }, (err) => {
           counterNbTable++;
           sqlErrs.push(err);
           this.log(`TransactionError: ${err.message}`);
-          this._errorHandler(ts, err);
+          this._errorHandler(undefined, err);
           if (counterNbTable === nbTables) {  callBack(sqlErrs);   }
         }, () => {
           counterNbTable++;
