@@ -93,3 +93,15 @@ export interface ProgressData {
   percent: number;
   position: string;
 }
+
+export enum DataOperation {
+  Inserted,
+  Updated,
+  Deleted
+}
+
+export interface DataRecord {
+  table: string;
+  record: any;
+  operation: DataOperation;
+}

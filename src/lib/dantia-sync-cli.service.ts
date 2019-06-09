@@ -1,7 +1,7 @@
 import { Injectable } from '@angular/core';
 import { DbWrapperService, DBTable, DBSchema } from 'db-wrapper';
 import { SqlTransaction, SqlResultSet, DataToSync, SqlError, DataFromServer, ProgressData,
-  SyncInfo, SyncResult, TableToSync, UserInfo } from './dantia-sync-cli.models';
+  SyncInfo, SyncResult, TableToSync, UserInfo, DataRecord, DataOperation } from './dantia-sync-cli.models';
 import { Observable } from 'rxjs';
 import { share} from 'rxjs/operators';
 
@@ -26,6 +26,8 @@ export class DantiaSyncCliService {
   public cbEndSync: () => void;
   public callBackProgress: (message: string, percent: number, position: string) => void;
   public progress$: Observable<ProgressData>;
+  public data$: Observable<DataRecord>;
+  private dataObserver: any;
   private progressObserver: any;
   public syncResult: SyncResult = null;
 
@@ -37,7 +39,10 @@ export class DantiaSyncCliService {
       this.progressObserver = observer;
     });
     this.progress$ = temp.pipe(share());
-
+    temp = Observable.create ( observer => {
+      this.dataObserver = observer;
+    });
+    this.data$ = temp.pipe(share());
   }
 
   initSync(theServerUrl: string, userInfo: UserInfo): Promise<void> {
@@ -126,11 +131,11 @@ export class DantiaSyncCliService {
         observer.next(resultado);
         observer.complete();
       };
-  
+
       self.callBackProgress = (message, percent, position) => {
-        this.progressObserver.next({message: message, percent: percent, position: position});
+        this.progressObserver.next({message, percent, position});
       };
-  
+
       if (self.syncResult !== null) {
         observer.next(self.syncResult);
       } else {
@@ -479,7 +484,11 @@ export class DantiaSyncCliService {
                     'change_time = (select MAX(change_time) FROM new_elem  ' +
                     'WHERE table_name = ?  AND id = ?) ';
 
-                self._executeSql(sql, [tableName, reg[idName], tableName, reg[idName] ], tx, () => { callBack(); },
+                self._executeSql(sql, [tableName, reg[idName], tableName, reg[idName] ], tx,
+                  () => {
+                    this.dataObserver.next({table: tableName, record: reg, operation: DataOperation.Updated});
+                    callBack();
+                  },
                   (ts, error) => {
                     self._errorHandler(ts, error);
                     callBack(error);
@@ -651,15 +660,24 @@ export class DantiaSyncCliService {
                         'change_time = (select MAX(change_time) FROM new_elem WHERE ' +
                         'table_name = ? AND id = ?) ';
 
-                    self._executeSql(sql, [tableName, reg[idName], tableName, reg[idName]], tx, () => { callBack (); });
+                    self._executeSql(sql, [tableName, reg[idName], tableName, reg[idName]], tx,
+                      () => {
+                        this.dataObserver.next({table: tableName, record: reg, operation: DataOperation.Inserted});
+                        callBack ();
+                      });
                 }, (ts, error) => {
                   self._errorHandler(ts, error);
                   callBack(error);
                 });
             } else {
-                self._executeSql(sql, attValue, tx, () => { callBack (); }, (ts, error) => {
-                  self._errorHandler(ts, error);
-                  callBack(error);
+                self._executeSql(sql, attValue, tx,
+                  () => {
+                    this.dataObserver.next({table: tableName, record: reg, operation: DataOperation.Inserted});
+                    callBack ();
+                  },
+                  (ts, error) => {
+                    self._errorHandler(ts, error);
+                    callBack(error);
                 });
             }
         } else {  // send conflict to server
@@ -715,7 +733,14 @@ export class DantiaSyncCliService {
       let  sql = `delete from ${tablename} WHERE ${idName} IN (${listIdToDelete.map(x => '?').join(',')})`;
       this._executeSql(sql, listIdToDelete, tx, () => {
         sql = `delete from delete_elem WHERE table_name = "${tablename}" and id  IN (${listIdToDelete.map(x => '?').join(',')})`;
-        self._executeSql(sql, listIdToDelete, tx, () => { callBack(true); });
+        self._executeSql(sql, listIdToDelete, tx, () => {
+          const reg = {};
+          listIdToDelete.forEach( x => {
+            reg[idName] = x;
+            this.dataObserver.next({table: tablename, record: reg, operation: DataOperation.Deleted});
+          });
+          callBack(true);
+        });
       });
     }
   }
