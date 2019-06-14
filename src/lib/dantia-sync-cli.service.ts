@@ -38,10 +38,12 @@ export class DantiaSyncCliService {
     let temp = Observable.create( observer => {
       this.progressObserver = observer;
     });
+    temp.subscribe(() => {});
     this.progress$ = temp.pipe(share());
     temp = Observable.create ( observer => {
       this.dataObserver = observer;
     });
+    temp.subscribe(() => {});
     this.data$ = temp.pipe(share());
   }
 
@@ -486,7 +488,7 @@ export class DantiaSyncCliService {
 
                 self._executeSql(sql, [tableName, reg[idName], tableName, reg[idName] ], tx,
                   () => {
-                    this.dataObserver.next({table: tableName, record: reg, operation: DataOperation.Updated});
+                    self.dataObserver.next({table: tableName, record: reg, operation: DataOperation.Updated});
                     callBack();
                   },
                   (ts, error) => {
@@ -564,8 +566,8 @@ export class DantiaSyncCliService {
       }, (err) => {
         counterNbTable++;
         sqlErrs.push(err);
-        this.log(`TransactionError: ${err.message}`);
-        this._errorHandler(undefined, err);
+        self.log(`TransactionError: ${err.message}`);
+        self._errorHandler(undefined, err);
         if (counterNbTable === nbTables) {  callBack(sqlErrs);   }
       }, () => {
         counterNbTable++;
@@ -737,7 +739,7 @@ export class DantiaSyncCliService {
           const reg = {};
           listIdToDelete.forEach( x => {
             reg[idName] = x;
-            this.dataObserver.next({table: tablename, record: reg, operation: DataOperation.Deleted});
+            self.dataObserver.next({table: tablename, record: reg, operation: DataOperation.Deleted});
           });
           callBack(true);
         });
