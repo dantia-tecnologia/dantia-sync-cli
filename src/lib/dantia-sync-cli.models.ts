@@ -49,12 +49,6 @@ export interface SyncInfo {
   password?: string;
 }
 
-export interface UserInfo {
-  uuid: string;
-  version: string;
-  username?: string;
-  password?: string;
-}
 
 export interface SyncProcess {
   completado: string[];

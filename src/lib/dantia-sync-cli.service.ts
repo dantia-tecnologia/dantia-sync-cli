@@ -1,7 +1,7 @@
 import { Injectable } from '@angular/core';
 import { DbWrapperService, DBTable, DBSchema } from 'db-wrapper';
 import { SqlTransaction, SqlResultSet, DataToSync, SqlError, DataFromServer, ProgressData,
-  SyncInfo, SyncResult, TableToSync, UserInfo, DataRecord, DataOperation } from './dantia-sync-cli.models';
+  SyncInfo, SyncResult, TableToSync, DataRecord, DataOperation } from './dantia-sync-cli.models';
 import { Observable } from 'rxjs';
 import { share} from 'rxjs/operators';
 
@@ -47,10 +47,13 @@ export class DantiaSyncCliService {
     this.data$ = temp.pipe(share());
   }
 
-  initSync(theServerUrl: string, userInfo: UserInfo): Promise<void> {
+  initSync(theServerUrl: string, userInfo: SyncInfo): Promise<void> {
     this.syncInfo.uuid = userInfo.uuid;
     this.syncInfo.version = userInfo.version;
     this.serverUrl = theServerUrl;
+    if (userInfo.appName) {
+      this.syncInfo.appName = userInfo.appName;
+    }
     this.syncInfo.sizeMax = this.sizeMax;
     if (userInfo.username) {
       this.username = userInfo.username;
@@ -694,7 +697,7 @@ export class DantiaSyncCliService {
 
     sql = 'select * FROM ' + tableName + ' WHERE ' + idName + ' = ?';
     self._selectSql(sql, [reg[idName]], tx, regloc => {
-        let dataToSend = {
+        const dataToSend = {
           info: self.syncInfo,
           client: null,
           server: null
