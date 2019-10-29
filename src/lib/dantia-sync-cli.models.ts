@@ -43,6 +43,7 @@ export interface SyncInfo {
   uuid: string;
   version: string;
   lastSyncDate: number;
+  appName?: string;
   sizeMax?: number;
   username?: string;
   password?: string;
