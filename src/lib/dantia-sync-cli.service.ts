@@ -5,7 +5,6 @@ import { SqlTransaction, SqlResultSet, DataToSync, SqlError, DataFromServer, Pro
 import { Observable } from 'rxjs';
 import { share} from 'rxjs/operators';
 
-
 @Injectable()
 export class DantiaSyncCliService {
   private db: any;
@@ -31,9 +30,9 @@ export class DantiaSyncCliService {
   private progressObserver: any;
   public syncResult: SyncResult = null;
 
-  constructor(db: DbWrapperService) {
-    this.db = db.db;
-    this.schema = db.schema;
+  constructor(private dbWrp: DbWrapperService) {
+    this.db = dbWrp.db;
+    this.schema = dbWrp.schema;
     this.syncInfo = {uuid: '', version: '0', lastSyncDate: 0};
     let temp = Observable.create( observer => {
       this.progressObserver = observer;
@@ -171,14 +170,18 @@ export class DantiaSyncCliService {
 
   private init(): Promise<void> {
     console.log('init');
-    this.schema.tables.forEach((table: DBTable) => {
-      if (table.sync) {
-        this.tablesToSync.push({tableName: table.name, idName: table.sync});
-        this.idNameFromTableName[table.name] = table.sync;
-      }
-    });
+    this.schema = this.dbWrp.schema;
+    this.db = this.dbWrp.db;
+    if (this.schema) {
+      this.schema.tables.forEach((table: DBTable) => {
+        if (table.sync) {
+          this.tablesToSync.push({tableName: table.name, idName: table.sync});
+          this.idNameFromTableName[table.name] = table.sync;
+        }
+      });
+    }
     return new Promise( (resolve, reject) => {
-      this.db.transaction( (tx:SqlTransaction) => {
+      this.db.transaction( (tx: SqlTransaction) => {
         this._executeSql('CREATE TABLE IF NOT EXISTS new_elem (table_name TEXT NOT NULL, id TEXT NOT NULL, ' +
             'change_time TIMESTAMP NOT NULL DEFAULT  (strftime(\'%s\',\'now\')));', [], tx);
         this._executeSql('CREATE INDEX IF NOT EXISTS index_tableName_newElem on new_elem (table_name)');
