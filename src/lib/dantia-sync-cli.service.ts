@@ -1,7 +1,7 @@
 import { Injectable } from '@angular/core';
 import { DbWrapperService, DBTable, DBSchema } from 'db-wrapper';
 import { SqlTransaction, SqlResultSet, DataToSync, SqlError, DataFromServer, ProgressData,
-  SyncInfo, SyncResult, TableToSync, DataRecord, DataOperation } from './dantia-sync-cli.models';
+  SyncInfo, SyncResult, TableToSync, DataRecord, DataOperation, SqlTransactionError } from './dantia-sync-cli.models';
 import { Observable } from 'rxjs';
 import { share} from 'rxjs/operators';
 
@@ -16,6 +16,7 @@ export class DantiaSyncCliService {
   private firstSyncDate = 0;
   private clientData;
   private serverData;
+  private SqlTranError: SqlTransactionError;
   private syncDate: number;
   private username: string;
   private password: string;
@@ -220,9 +221,8 @@ export class DantiaSyncCliService {
             }
           }
         });
-      }, (ts: SqlTransaction, err: SqlError) => {
-        this._errorHandler(ts ,err);
-        reject(err);
+      }, (err: SqlError) => {
+        reject(this.SqlTranError);
       }, () => {
         console.log('sync activo.');
         resolve();
@@ -554,7 +554,7 @@ export class DantiaSyncCliService {
               for (let i = 0; i < nb; i++) {
                 curr = currData[i];
 
-                if (idInDb[curr[table.idName]]) {// update
+                if (idInDb.indexOf(curr[table.idName]) !== -1) {// update
                     self._updateRecord(table.tableName, table.idName, curr, tx, (err) => {
                       counterNbElmTab++;
                       if (err) { sqlErrs.push(err); }
@@ -571,9 +571,7 @@ export class DantiaSyncCliService {
         }); // end delete elements
       }, (err) => {
         counterNbTable++;
-        sqlErrs.push(err);
-        self.log(`TransactionError: ${err.message}`);
-        self._errorHandler(undefined, err);
+        sqlErrs.push(self.SqlTranError);
         if (counterNbTable === nbTables) {  callBack(sqlErrs);   }
       }, () => {
         counterNbTable++;
@@ -733,38 +731,89 @@ export class DantiaSyncCliService {
   }
 
   private _deleteTableLocalDb(tablename: string, idName: string, listIdToDelete: any[],
-                              tx: SqlTransaction, callBack: (final: boolean) => void): void {
-    const self = this;
+    tx: SqlTransaction, callBack: (final: boolean) => void): void {
+
+    const listIds = [];
+    let orden = 0;
     if (listIdToDelete.length === 0) {
       callBack(true);
     } else {
-      let  sql = `delete from ${tablename} WHERE ${idName} IN (${listIdToDelete.map(x => '?').join(',')})`;
-      this._executeSql(sql, listIdToDelete, tx, () => {
-        sql = `delete from delete_elem WHERE table_name = "${tablename}" and id  IN (${listIdToDelete.map(x => '?').join(',')})`;
-        self._executeSql(sql, listIdToDelete, tx, () => {
-          const reg = {};
-          listIdToDelete.forEach( x => {
-            reg[idName] = x;
-            self.dataObserver.next({table: tablename, record: reg, operation: DataOperation.Deleted});
-          });
-          callBack(true);
+      listIds.push(
+        listIdToDelete.reduce((listIdsDel, id, ix) => {
+          if ((ix % 50) === 0 && listIdsDel.length !== 0) {
+            listIds.push(listIdsDel);
+            listIdsDel = [];
+          }
+          listIdsDel.push(id);
+          return listIdsDel;
+        }, [])
+      );
+
+      listIds.map((listIdsDel, ix, list) => {
+        this._deleteParcialTableLocalDb(tablename, idName, listIdsDel, tx, () => {
+          if (++orden === list.length) {
+            callBack(true);
+          }
         });
       });
     }
   }
 
+  private _deleteParcialTableLocalDb(tablename: string, idName: string, listIdToDelete: any[],
+                              tx: SqlTransaction, callBack: (final: boolean) => void): void {
+    const self = this;
+
+    let  sql = `delete from ${tablename} WHERE ${idName} IN (${listIdToDelete.map(x => '?').join(',')})`;
+    this._executeSql(sql, listIdToDelete, tx, () => {
+      sql = `delete from delete_elem WHERE table_name = "${tablename}" and id  IN (${listIdToDelete.map(x => '?').join(',')})`;
+      self._executeSql(sql, listIdToDelete, tx, () => {
+        const reg = {};
+        listIdToDelete.forEach( x => {
+          reg[idName] = x;
+          self.dataObserver.next({table: tablename, record: reg, operation: DataOperation.Deleted});
+        });
+        callBack(true);
+      });
+    });
+  }
+
   private _getIdExitingInDB(tableName: string, idName: string, listIdToCheck: any[], tx: SqlTransaction,
-                            dataCallBack: (IdExiting: boolean[]) => void): void {
+    dataCallBack: (IdExiting: any[]) => void): void {
+
+    const listIds = [];
+    let idsInDb = [];
+    let orden = 0;
     if (listIdToCheck.length === 0) {
       dataCallBack([]);
     } else {
-      const sql = `select ${idName} FROM ${tableName} WHERE ${idName} IN ( ${listIdToCheck.map(x => '?').join(',')} )`;
-      this._selectSql(sql, listIdToCheck, tx, (idsFind) =>  {
-          const idsInDb = [];
-          idsFind.forEach(id => { idsInDb[id] = true; } );
-          dataCallBack(idsInDb);
+      listIds.push(
+        listIdToCheck.reduce((listIdsCheck, id, ix) => {
+          if ((ix % 50) === 0 && listIdsCheck.length !== 0) {
+            listIds.push(listIdsCheck);
+            listIdsCheck = [];
+          }
+          listIdsCheck.push(id);
+          return listIdsCheck;
+        }, [])
+      );
+
+      listIds.map((listIdsCheck, ix, list) => {
+        this._getParcialIdExitingInDB(tableName, idName, listIdsCheck, tx, (idsFind) => {
+          idsInDb = idsInDb.concat(idsFind);
+          if (++orden === list.length) {
+            dataCallBack(idsInDb);
+          }
+        });
       });
     }
+  }
+
+  private _getParcialIdExitingInDB(tableName: string, idName: string, listIdToCheck: any[], tx: SqlTransaction,
+                            dataCallBack: (IdExiting: any[]) => void): void {
+    const sql = `select ${idName} FROM ${tableName} WHERE ${idName} IN ( ${listIdToCheck.map(x => '?').join(',')} )`;
+    this._selectSql(sql, listIdToCheck, tx, (idsFind) =>  {
+        dataCallBack(idsFind);
+    });
   }
 /*
   private _batch (execSql:SqlStatement[]): Promise<SqlResultSet[]> {
@@ -825,7 +874,8 @@ export class DantiaSyncCliService {
     tx.executeSql(sql, params, dataHandler,
       (transaction: SqlTransaction, error: SqlError) => {
             this.log('sql error: ' + sql);
-            errorHandler(transaction, error);
+            this.SqlTranError = {message: error.message, code: error.code, sql};
+            return errorHandler(transaction, error);
         }
     );
   }
@@ -844,26 +894,26 @@ export class DantiaSyncCliService {
         optionalCallBack = self._defaultCallBack;
     }
     if (!optionalErrorHandler) {
-        optionalErrorHandler = self._errorHandler;
+        optionalErrorHandler = this._errorHandler;
     }
     if (optionalTransaction) {
-        self._executeSqlBridge(optionalTransaction, sql, params || [], optionalCallBack, optionalErrorHandler);
+        this._executeSqlBridge(optionalTransaction, sql, params || [], optionalCallBack, optionalErrorHandler);
     } else {
       if (sql.indexOf('select') === 0) {
-        self.db.readTransaction ((tx: SqlTransaction) => {
+        this.db.readTransaction ((tx: SqlTransaction) => {
             self._executeSqlBridge(tx, sql, params, optionalCallBack, optionalErrorHandler);
         });
       } else {
-        self.db.transaction ((tx: SqlTransaction) => {
+        this.db.transaction ((tx: SqlTransaction) => {
           self._executeSqlBridge(tx, sql, params, optionalCallBack, optionalErrorHandler);
-      });
+        });
       }
     }
   }
 
 
   private _defaultCallBack(transaction: SqlTransaction, results: SqlResultSet) {
-  //DBSYNC.log('SQL Query executed. insertId: '+results.insertId+' rows.length '+results.rows.length);
+  // DBSYNC.log('SQL Query executed. insertId: '+results.insertId+' rows.length '+results.rows.length);
   }
 
   private _selectSql(sql: string, params?: any[], optionalTransaction?: SqlTransaction,
@@ -873,9 +923,10 @@ export class DantiaSyncCliService {
       (tx, rs) => { callBack(self._transformRs(rs)); });
   }
 
-  private _errorHandler(transaction: SqlTransaction, error: SqlError) {
-    this.log(error);
+  private _errorHandler = (transaction: SqlTransaction, error: SqlError) => {
+    // this.log(error);
     this.error('Error : ' + error.message + ' (Code ' + error.code + ')' );
+    return true;
   }
 
   private _buildInsertSQL(tableName: string, objToInsert: Object): string {

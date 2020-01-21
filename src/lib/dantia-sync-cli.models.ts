@@ -34,6 +34,12 @@ export interface SqlError {
   message: string;
 }
 
+export interface SqlTransactionError {
+  code: number;
+  message: string;
+  sql: string;
+}
+
 export interface TableToSync {
   tableName: string;
   idName: string;
