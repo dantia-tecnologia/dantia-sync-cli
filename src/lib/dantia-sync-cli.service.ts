@@ -176,7 +176,7 @@ export class DantiaSyncCliService {
     if (this.schema) {
       this.schema.tables.forEach((table: DBTable) => {
         if (table.sync) {
-          this.tablesToSync.push({tableName: table.name, idName: table.sync});
+          this.tablesToSync.push({tableName: table.name, idName: table.sync, ddl: ''});
           this.idNameFromTableName[table.name] = table.sync;
         }
       });
@@ -206,7 +206,9 @@ export class DantiaSyncCliService {
           this._executeSql('CREATE TRIGGER IF NOT EXISTS delete_' + curr.tableName + '  AFTER DELETE ON ' + curr.tableName + ' ' +
                     'BEGIN INSERT INTO delete_elem (table_name, id) VALUES ' +
                     '("' + curr.tableName + '", old.' + curr.idName + '); END;', [], tx);
+          this._getDDLTable(curr.tableName, tx, (ddl) => { curr.ddl = ddl; });
         });
+
         this._selectSql('SELECT last_sync FROM sync_info', [], tx, res => {
           if (res.length === 0 || res[0] === 0) { // First sync (or data lost)
             if (res.length === 0) {
@@ -229,6 +231,7 @@ export class DantiaSyncCliService {
       });
     });
   }
+
 
   private _syncNowGo(modelsToBck: string[],
                      callBackProgress: (message: string, percent: number, position: string) => void, saveBandwidth: boolean) {
@@ -481,8 +484,8 @@ export class DantiaSyncCliService {
     this._detectConflict(tableName, reg[idName], tx, exists => {
         if (!exists) {
             /*ex : UPDATE "tableName" SET colonne 1 = [valeur 1], colonne 2 = [valeur 2]*/
-            const attList = this._getAttributesList(reg);
-            sql = this._buildUpdateSQL(tableName, reg);
+            const attList = this._getAttributesList(tableName, reg);
+            sql = this._buildUpdateSQL(tableName, reg, attList);
             sql += ' WHERE ' + idName + ' = ? ';
             const attValue = this._getMembersValue(reg, attList);
 
@@ -656,8 +659,8 @@ export class DantiaSyncCliService {
         if (!exists) {
 
             // 'ex INSERT INTO tablename (id, name, type, etc) VALUES (?, ?, ?, ?);'
-            const attList = self._getAttributesList(reg);
-            sql = self._buildInsertSQL(tableName, reg);
+            const attList = self._getAttributesList(tableName, reg);
+            sql = self._buildInsertSQL(tableName, reg, attList);
             const attValue = self._getMembersValue(reg, attList);
             if (!self.firstSync) {
                 self._executeSql(sql, attValue, tx, () => {
@@ -929,8 +932,10 @@ export class DantiaSyncCliService {
     return true;
   }
 
-  private _buildInsertSQL(tableName: string, objToInsert: Object): string {
-    const members = this._getAttributesList(objToInsert);
+  private _buildInsertSQL(tableName: string, objToInsert: Object, attrList?: any[]): string {
+    let members;
+    if (attrList) { members = attrList;
+    } else { members = this._getAttributesList(tableName, objToInsert);  }
     if (members.length === 0) {
         throw new Error('buildInsertSQL : Error, try to insert an empty object in the table ' + tableName);
     }
@@ -943,14 +948,17 @@ export class DantiaSyncCliService {
     return sql;
   }
 
-  private _buildUpdateSQL(tableName: string, objToUpdate: Object): string {
+  private _buildUpdateSQL(tableName: string, objToUpdate: Object, attrList?: any[]): string {
   /*ex UPDATE "nom de table" SET colonne 1 = [valeur 1], colonne 2 = [valeur 2] WHERE {condition}*/
+    let members;
     let sql = 'UPDATE ' + tableName + ' SET ';
-    const members = this._getAttributesList(objToUpdate);
+    if (attrList) { members = attrList;
+    } else {
+      members = this._getAttributesList(tableName, objToUpdate);
+    }
     if (members.length === 0) {
         throw new Error('buildUpdateSQL : Error, try to insert an empty object in the table ' + tableName);
     }
-    // let values = this._getMembersValue(objToUpdate, members);
 
     const nb = members.length;
     for (let i = 0; i < nb; i++) {
@@ -980,13 +988,14 @@ export class DantiaSyncCliService {
     return memberArray;
   }
 
-  private _getAttributesList(obj: Object, check?: any): any[] {
+  private _getAttributesList(tableName: string, obj: Object, check?: any): any[] {
     const memberArray = [];
+    const table = this._getTableToProcess(tableName);
     for (const elm in obj) {
         if (check && typeof this[elm] === 'function' && !obj.hasOwnProperty(elm)) {
             continue;
         }
-        memberArray.push(elm);
+        if (table.ddl.indexOf(elm) === -1) { continue; } else { memberArray.push(elm); }
     }
     return memberArray;
   }
@@ -1116,6 +1125,20 @@ export class DantiaSyncCliService {
 
     XHR.send(data);
 
+  }
+
+  private _columnExists(table: string, column: string, optionalTransaction, callback: (response: boolean) => void) {
+    const self = this;
+    self._getDDLTable(table, optionalTransaction,
+      (ddl) => {
+        if (ddl.indexOf(column) === -1) { callback(false); } else {  callback(true); }
+      });
+  }
+
+  private _getDDLTable (table: string, optionalTransaction, callback: (response: string) => void) {
+    const self = this;
+    const sql = 'select sql from sqlite_master where type=\'table\' and name=\'' + table + '\'';
+    self._selectSql(sql, [], optionalTransaction, (rs) => { callback(rs[0]); });
   }
 
   private _progressRatio (nbIx: number, nbCompleted: number, nbPending): number {

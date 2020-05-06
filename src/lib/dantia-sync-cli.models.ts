@@ -43,6 +43,7 @@ export interface SqlTransactionError {
 export interface TableToSync {
   tableName: string;
   idName: string;
+  ddl: string;
 }
 
 export interface SyncInfo {
