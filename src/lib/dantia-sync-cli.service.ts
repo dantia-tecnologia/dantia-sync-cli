@@ -34,7 +34,7 @@ export class DantiaSyncCliService {
   constructor(private dbWrp: DbWrapperService) {
     this.db = dbWrp.db;
     this.schema = dbWrp.schema;
-    this.syncInfo = {uuid: '', version: '0', lastSyncDate: 0};
+    this.syncInfo = {uuid: '', version: '0', lastSyncDate: {}};
     let temp = Observable.create( observer => {
       this.progressObserver = observer;
     });
@@ -93,19 +93,21 @@ export class DantiaSyncCliService {
     }
   }
 
-  getLastSyncdate(): number {
-    return this.syncInfo.lastSyncDate;
+  getLastSyncdate(tableName: string): number {
+    if (this.syncInfo.lastSyncDate.hasOwnProperty(tableName)) {
+      return this.syncInfo.lastSyncDate[tableName];
+    } else {
+      throw new Error(`${tableName} not found.`);
+    }
   }
 
-  setSyncDate(val: number) {
-    this.syncInfo.lastSyncDate = val;
-    this._executeSql('UPDATE sync_info SET last_sync = ' + this.syncInfo.lastSyncDate, []);
-  }
-
-  setFirstSync() {
-    this.firstSync = true;
-    this.syncInfo.lastSyncDate = 0;
-    this._executeSql('UPDATE sync_info SET last_sync = ' + this.syncInfo.lastSyncDate, []);
+  setSyncDate(tableName: string, val: number) {
+    if (this.syncInfo.lastSyncDate.hasOwnProperty(tableName)) {
+      this.syncInfo.lastSyncDate[tableName] = val;
+      this._executeSql('UPDATE sync_info SET last_sync = ? where table_name = ?', [val, tableName]);
+    } else {
+      throw new Error(`${tableName} not found.`);
+    }
   }
 
   log(message) {
@@ -120,9 +122,12 @@ export class DantiaSyncCliService {
     console.error(message);
   }
 
-  syncNow(saveBandwidth?: boolean): Observable<SyncResult> {
+  syncNow(modelsToSync?: string[] | string, saveBandwidth?: boolean): Observable<SyncResult> {
     const self = this;
     let modelsToBackup = [];
+    if (modelsToSync) {
+      modelsToBackup = this.checkModelsList(modelsToSync);
+    }
     if (this.db === null) {
         self.log('You should call the initSync before (db is null)');
         throw new Error ('You should call the initSync before (db is null)');
@@ -152,15 +157,16 @@ export class DantiaSyncCliService {
             localDataUpdated: false,
             syncOK: false,
             serverAnswer: null
-          }
+          };
           // self.syncResult.models = {pendiente = [], completado = []};
-          self.tablesToSync.forEach( table => {
-              modelsToBackup.push(table.tableName);
-          });
-
+          if (modelsToBackup.length === 0) {
+            self.tablesToSync.forEach( table => {
+                modelsToBackup.push(table.tableName);
+            });
+          }
           this.callBackProgress('Getting local data to backup', 0, 'getData');
 
-          self.syncDate = Math.round(new Date().getTime()/1000.0);
+          self.syncDate = Math.round(new Date().getTime() / 1000.0);
           self.firstSyncDate = 0;
           self._syncNowGo(modelsToBackup, this.callBackProgress, saveBandwidth);
       }
@@ -189,7 +195,7 @@ export class DantiaSyncCliService {
         this._executeSql('CREATE TABLE IF NOT EXISTS delete_elem (table_name TEXT NOT NULL, id TEXT NOT NULL, ' +
             'change_time TIMESTAMP NOT NULL DEFAULT  (strftime(\'%s\',\'now\')));', [], tx);
         this._executeSql('CREATE INDEX IF NOT EXISTS index_tableName_deleteElem on delete_elem (table_name)');
-        this._executeSql('CREATE TABLE IF NOT EXISTS sync_info (last_sync TIMESTAMP);', [], tx);
+        this._executeSql('CREATE TABLE IF NOT EXISTS sync_info (table_name TEXT NOT NULL, last_sync TIMESTAMP);', [], tx);
 
         // create triggers to automatically fill the new_elem table (this table will contains a pointer to all the modified data)
         this.tablesToSync.forEach(curr => {
@@ -207,22 +213,20 @@ export class DantiaSyncCliService {
                     'BEGIN INSERT INTO delete_elem (table_name, id) VALUES ' +
                     '("' + curr.tableName + '", old.' + curr.idName + '); END;', [], tx);
           this._getDDLTable(curr.tableName, tx, (ddl) => { curr.ddl = ddl; });
+          this._selectSql('SELECT last_sync FROM sync_info where table_name = ?', [curr.tableName], tx, res => {
+            if (res.length === 0 || res[0] === 0) { // First sync (or data lost)
+              if (res.length === 0) {
+                this._executeSql('INSERT OR REPLACE INTO sync_info (table_name, last_sync) VALUES (?,?)', [curr.tableName, 0], tx);
+              }
+              this.firstSync = true;
+              this.syncInfo.lastSyncDate[curr.tableName] = 0;
+            } else {
+              this.syncInfo.lastSyncDate[curr.tableName] = res[0];
+              if (this.syncInfo.lastSyncDate[curr.tableName] === 0) { this.firstSync = true; }
+            }
+          });
         });
 
-        this._selectSql('SELECT last_sync FROM sync_info', [], tx, res => {
-          if (res.length === 0 || res[0] === 0) { // First sync (or data lost)
-            if (res.length === 0) {
-              this._executeSql('INSERT OR REPLACE INTO sync_info (last_sync) VALUES (0)', [], tx);
-            }
-            this.firstSync = true;
-            this.syncInfo.lastSyncDate = 0;
-          } else {
-            this.syncInfo.lastSyncDate = res[0];
-            if (this.syncInfo.lastSyncDate === 0) {
-                this.firstSync = true;
-            }
-          }
-        });
       }, (err: SqlError) => {
         reject(this.SqlTranError);
       }, () => {
@@ -285,16 +289,14 @@ export class DantiaSyncCliService {
                       self.syncResult.serverAnswer = serverData; // include the original server answer, just in case
                       self.cbEndSync();
                     } else if (serverData.models.pendiente.length === 0)  {
-                      self._finishSync(serverData.syncDate, () => {
-                        self.syncResult.localDataUpdated = self.syncResult.nbUpdated > 0;
-                        self.syncResult.syncOK = true;
-                        self.syncResult.codeStr = 'syncOk';
-                        self.syncResult.message = 'First load synchronized successfully. (' + self.syncResult.nbSent +
-                            ' new/modified element saved, ' + self.syncResult.nbUpdated + ' updated and ' +
-                            self.syncResult.nbDeleted + ' deleted elements.)';
-                        self.syncResult.serverAnswer = serverData; // include the original server answer, just in case
-                        self.cbEndSync();
-                      });
+                      self.syncResult.localDataUpdated = self.syncResult.nbUpdated > 0;
+                      self.syncResult.syncOK = true;
+                      self.syncResult.codeStr = 'syncOk';
+                      self.syncResult.message = 'First load synchronized successfully. (' + self.syncResult.nbSent +
+                          ' new/modified element saved, ' + self.syncResult.nbUpdated + ' updated and ' +
+                          self.syncResult.nbDeleted + ' deleted elements.)';
+                      self.syncResult.serverAnswer = serverData; // include the original server answer, just in case
+                      self.cbEndSync();
                     } else {
                       self._syncNowGo(serverData.models.pendiente, callBackProgress, saveBandwidth);
                     }
@@ -311,16 +313,14 @@ export class DantiaSyncCliService {
                       self.syncResult.serverAnswer = serverData; // include the original server answer, just in case
                       self.cbEndSync();
                     } else if (serverData.models.pendiente.length === 0)  {
-                      self._finishSync(serverData.syncDate, () => {
-                        self.syncResult.localDataUpdated = self.syncResult.nbUpdated > 0;
-                        self.syncResult.syncOK = true;
-                        self.syncResult.codeStr = 'syncOk';
-                        self.syncResult.message = 'Data synchronized successfully. (' + self.syncResult.nbSent +
-                            ' new/modified element saved, ' + self.syncResult.nbUpdated + ' updated and ' +
-                            self.syncResult.nbDeleted + ' deleted elements.)';
-                        self.syncResult.serverAnswer = serverData; // include the original server answer, just in case
-                        self.cbEndSync();
-                      });
+                      self.syncResult.localDataUpdated = self.syncResult.nbUpdated > 0;
+                      self.syncResult.syncOK = true;
+                      self.syncResult.codeStr = 'syncOk';
+                      self.syncResult.message = 'Data synchronized successfully. (' + self.syncResult.nbSent +
+                          ' new/modified element saved, ' + self.syncResult.nbUpdated + ' updated and ' +
+                          self.syncResult.nbDeleted + ' deleted elements.)';
+                      self.syncResult.serverAnswer = serverData; // include the original server answer, just in case
+                      self.cbEndSync();
                     } else {
                       self._syncNowGo(serverData.models.pendiente, callBackProgress, saveBandwidth);
                     }
@@ -336,14 +336,14 @@ export class DantiaSyncCliService {
     let nbData = 0;
     const self = this;
     this.log('_getDataToBackup');
-    let dataToSync: DataToSync = {
+    const dataToSync: DataToSync = {
         info: this.syncInfo,
         data: {},
         delete_elem: {}
     };
     self.db.readTransaction( (tx: SqlTransaction) => {
       let counter = 0;
-      let nbTables = modelsToBck.length;
+      const nbTables = modelsToBck.length;
       modelsToBck.forEach((tableName: string) => { // a simple for will not work here because we have an asynchronous call inside
         const currTable: TableToSync = self._getTableToProcess(tableName);
         this._getDataToSavDel(currTable.tableName, currTable.idName, this.firstSync, tx, data => {
@@ -360,61 +360,59 @@ export class DantiaSyncCliService {
 
     }, (err: SqlError) => {
       self.log('TransactionError: _getDataToBackup');
-      self._errorHandler(undefined ,err);
+      self._errorHandler(undefined , err);
     }, () => {
       self.log('TransactionFinish: _getDataToBackup');
     });
   }
 
-  private _finishSync(syncDate: number,  callBack?: () => void): void {
+  private _finishSync(tableName: string, syncDate: number,  callBack?: () => void): void {
     this.firstSync = false;
     this.db.transaction( (tx: SqlTransaction) => {
       if (this.firstSyncDate !== 0) {
-          this.syncInfo.lastSyncDate = this.firstSyncDate;
-          this._executeSql(`UPDATE sync_info SET last_sync = ${this.firstSyncDate}`, [], tx);
+          this.syncInfo.lastSyncDate[tableName] = this.firstSyncDate;
+          this._executeSql('UPDATE sync_info SET last_sync = ? where  table_name = ?', [this.firstSyncDate, tableName], tx);
       } else {
-          this.syncInfo.lastSyncDate = syncDate;
-          this._executeSql(`UPDATE sync_info SET last_sync = ${syncDate}`, [], tx);
+          this.syncInfo.lastSyncDate[tableName] = syncDate;
+          this._executeSql('UPDATE sync_info SET last_sync = ? where  table_name = ?', [syncDate, tableName], tx);
       }
       // Remove only the elem sent to the server (in case new_elem has been added during the sync)
       // We don't do that anymore: this._executeSql('DELETE FROM new_elem', [], tx);
 
-      for (let tableName in this.clientData.data) {
-        if (this.clientData.data.hasOwnProperty(tableName)) {
-          let idsNewToDelete = [];
-          let idsDelToDelete = [];
-          let idsString = '';
-          let idName =  this.idNameFromTableName[tableName];
-          this.clientData.data[tableName].forEach(reg => {
-              if (reg.TipoOper === 'U') {
-                  idsNewToDelete.push(reg[idName]);
-              } else {
-                  idsDelToDelete.push(reg.IdOper);
-              }
-          });
-          if (idsNewToDelete.length > 0) {
-            idsString = idsNewToDelete.map(x => '?').join(',');
-            this._executeSql(`DELETE FROM new_elem WHERE table_name ='${tableName}'
-                AND id IN (${idsString})
-                AND change_time <= ${this.syncDate}`, idsNewToDelete, tx);
-          }
+      if (this.clientData.data.hasOwnProperty(tableName)) {
+        const idsNewToDelete = [];
+        const idsDelToDelete = [];
+        let idsString = '';
+        const idName =  this.idNameFromTableName[tableName];
+        this.clientData.data[tableName].forEach(reg => {
+            if (reg.TipoOper === 'U') {
+                idsNewToDelete.push(reg[idName]);
+            } else {
+                idsDelToDelete.push(reg.IdOper);
+            }
+        });
+        if (idsNewToDelete.length > 0) {
+          idsString = idsNewToDelete.map(x => '?').join(',');
+          this._executeSql(`DELETE FROM new_elem WHERE table_name ='${tableName}'
+              AND id IN (${idsString})
+              AND change_time <= ${syncDate}`, idsNewToDelete, tx);
+        }
 
-          if (idsDelToDelete.length > 0) {
-            idsString = idsDelToDelete.map(x => '?').join(',');
-            this._executeSql(`DELETE FROM delete_elem WHERE table_name = '${tableName}'
-                AND id IN (${idsString})
-                AND change_time <= ${this.syncDate}`, idsDelToDelete, tx);
-          }
+        if (idsDelToDelete.length > 0) {
+          idsString = idsDelToDelete.map(x => '?').join(',');
+          this._executeSql(`DELETE FROM delete_elem WHERE table_name = '${tableName}'
+              AND id IN (${idsString})
+              AND change_time <= ${syncDate}`, idsDelToDelete, tx);
         }
       }
     }, (err: SqlError) => {
       this._errorHandler(undefined, err);
-      this.clientData = null;
-      this.serverData = null;
+      delete this.clientData.data[tableName]; // this.clientData = null;
+      delete this.serverData.data[tableName];  // this.serverData = null;
       callBack();
     }, () => {
-      this.clientData = null;
-      this.serverData = null;
+      delete this.clientData.data[tableName]; // this.clientData = null;
+      delete this.serverData.data[tableName];  // this.serverData = null;
       callBack();
     });
   }
@@ -477,7 +475,7 @@ export class DantiaSyncCliService {
     }
   }
 
-  private _updateRecord(tableName: string, idName: string, reg: Object, tx: SqlTransaction, callBack?: (sqlErr?: SqlError) => void ) {
+  private _updateRecord(tableName: string, idName: string, reg: object, tx: SqlTransaction, callBack?: (sqlErr?: SqlError) => void ) {
     let sql: string;
     const self = this;
 
@@ -518,7 +516,7 @@ export class DantiaSyncCliService {
 
     const self = this;
     self.serverData = serverData;
-    let sqlErrs: SqlError[] = [];
+    const sqlErrs: SqlError[] = [];
     if (typeof serverData.data === 'undefined' || serverData.data.length === 0) {
         // nothing to update
         callBack();
@@ -530,6 +528,7 @@ export class DantiaSyncCliService {
     let counterNbElm = 0;
     serverData.models.completado.forEach(tableName => {
       const table = self._getTableToProcess(tableName);
+      let sqlErrsTable = false;
       let currData = serverData.data[table.tableName];
       let deleData = serverData.data.delete_elem[table.tableName];
 
@@ -547,7 +546,7 @@ export class DantiaSyncCliService {
 
       self.db.transaction((tx: SqlTransaction) => {
         self._deleteTableLocalDb (table.tableName, table.idName, deleData, tx,  () => {
-          let listIdToCheck = [];
+          const listIdToCheck = [];
           if (nb !== 0) {
             for (let i = 0; i < nb; i++) {
                 listIdToCheck.push(currData[i][table.idName]);
@@ -560,14 +559,21 @@ export class DantiaSyncCliService {
                 if (idInDb.indexOf(curr[table.idName]) !== -1) {// update
                     self._updateRecord(table.tableName, table.idName, curr, tx, (err) => {
                       counterNbElmTab++;
-                      if (err) { sqlErrs.push(err); }
+                      if (err) { sqlErrs.push(err); sqlErrsTable = true; }
+                      if (counterNbElmTab === nb && !sqlErrsTable ) {
+                        self._finishSync(table.tableName, serverData.syncDate);
+                      }
                     });
                 } else {// insert
                   self._insertRecord(table.tableName, table.idName, curr, tx, (err) => {
                       counterNbElmTab++;
-                      if (err) { sqlErrs.push(err); }
+                      if (err) { sqlErrs.push(err); sqlErrsTable = true; }
+                      if (counterNbElmTab === nb && !sqlErrsTable) {
+                        self._finishSync(table.tableName, serverData.syncDate);
+                      }
                   });
                 }
+
               } // end for
             }); // end getExisting Id
           }
@@ -583,8 +589,7 @@ export class DantiaSyncCliService {
         this.log(`TransactionFinish: ${table.tableName} percent: ${perProgress.toString()}`);
         callBackProgress(table.tableName, perProgress, 'updateLocalDB');
         if (counterNbTable === nbTables) {
-          if (sqlErrs.length === 0) { callBack(); }
-          else { callBack(sqlErrs); }
+          if (sqlErrs.length === 0) { callBack(); } else { callBack(sqlErrs); }
         }
       }); // end tx
     }); // end forEach
@@ -593,7 +598,7 @@ export class DantiaSyncCliService {
   private _updateFirstLocalDb(serverData: any, callBack: (sqlErrs?: SqlError[]) => void,
                               callBackProgress: (message: string, percent: number, position: string) => void): void {
     this.serverData = serverData;
-    let sqlErrs: SqlError[] = [];
+    const sqlErrs: SqlError[] = [];
 
     if (typeof serverData.data === 'undefined' || serverData.data.length === 0) {
         // nothing to update
@@ -609,9 +614,10 @@ export class DantiaSyncCliService {
     serverData.models.completado.forEach(tableName => {
         const table = this._getTableToProcess(tableName);
         let currData = serverData.data[table.tableName];
+        let sqlErrsTable = false;
         if (!currData) {
-            //Should always be defined (even if 0 elements)
-            //Must not be null
+            // Should always be defined (even if 0 elements)
+            // Must not be null
             currData = [];
         }
         const nb = currData.length;
@@ -624,8 +630,10 @@ export class DantiaSyncCliService {
             for (let i = 0; i < nb; i++) {
               this._insertRecord(table.tableName, table.idName, currData[i], tx, (err) => {
                 counterNbElmTab++;
-                if (err) { sqlErrs.push(err); }
-
+                if (err) { sqlErrs.push(err); sqlErrsTable = true; }
+                if (counterNbElmTab === nb && !sqlErrsTable) {
+                  this._finishSync(table.tableName, serverData.syncDate);
+                }
               });
             }
           }
@@ -643,14 +651,13 @@ export class DantiaSyncCliService {
           this.log(`TransactionFinish: ${table.tableName}  percent: ${perProgress.toString()}`);
           callBackProgress(table.tableName, perProgress, 'updateFirstLocalDb');
           if (counterNbTable === nbTables) {
-            if (sqlErrs.length === 0) { callBack(); }
-            else { callBack(sqlErrs); }
+            if (sqlErrs.length === 0) { callBack(); }  else { callBack(sqlErrs); }
           }
         });
     }); // end forEach
   }
 
-  private _insertRecord(tableName: string, idName: string, reg: Object, tx: SqlTransaction, callBack?: (sqlErr?: SqlError) => void) {
+  private _insertRecord(tableName: string, idName: string, reg: object, tx: SqlTransaction, callBack?: (sqlErr?: SqlError) => void) {
     let sql: string;
     const self = this;
 
@@ -695,7 +702,7 @@ export class DantiaSyncCliService {
     });
   }
 
-  private _sendConflict(tableName: string, idName: any, reg: Object, tx: SqlTransaction): void {
+  private _sendConflict(tableName: string, idName: any, reg: object, tx: SqlTransaction): void {
     const self = this;
     let sql: string ;
 
@@ -716,7 +723,7 @@ export class DantiaSyncCliService {
     });
   }
 
-  private _transformRs(rs: SqlResultSet): Object[] {
+  private _transformRs(rs: SqlResultSet): object[] {
     let elms = [];
     if (typeof rs.rows === 'undefined') {
         return elms;
@@ -734,7 +741,7 @@ export class DantiaSyncCliService {
   }
 
   private _deleteTableLocalDb(tablename: string, idName: string, listIdToDelete: any[],
-    tx: SqlTransaction, callBack: (final: boolean) => void): void {
+                              tx: SqlTransaction, callBack: (final: boolean) => void): void {
 
     const listIds = [];
     let orden = 0;
@@ -763,7 +770,7 @@ export class DantiaSyncCliService {
   }
 
   private _deleteParcialTableLocalDb(tablename: string, idName: string, listIdToDelete: any[],
-                              tx: SqlTransaction, callBack: (final: boolean) => void): void {
+                                     tx: SqlTransaction, callBack: (final: boolean) => void): void {
     const self = this;
 
     let  sql = `delete from ${tablename} WHERE ${idName} IN (${listIdToDelete.map(x => '?').join(',')})`;
@@ -781,7 +788,7 @@ export class DantiaSyncCliService {
   }
 
   private _getIdExitingInDB(tableName: string, idName: string, listIdToCheck: any[], tx: SqlTransaction,
-    dataCallBack: (IdExiting: any[]) => void): void {
+                            dataCallBack: (IdExiting: any[]) => void): void {
 
     const listIds = [];
     let idsInDb = [];
@@ -812,7 +819,7 @@ export class DantiaSyncCliService {
   }
 
   private _getParcialIdExitingInDB(tableName: string, idName: string, listIdToCheck: any[], tx: SqlTransaction,
-                            dataCallBack: (IdExiting: any[]) => void): void {
+                                   dataCallBack: (IdExiting: any[]) => void): void {
     const sql = `select ${idName} FROM ${tableName} WHERE ${idName} IN ( ${listIdToCheck.map(x => '?').join(',')} )`;
     this._selectSql(sql, listIdToCheck, tx, (idsFind) =>  {
         dataCallBack(idsFind);
@@ -920,7 +927,7 @@ export class DantiaSyncCliService {
   }
 
   private _selectSql(sql: string, params?: any[], optionalTransaction?: SqlTransaction,
-                     callBack?: (result: Object[] | any[]) => void): void {
+                     callBack?: (result: object[] | any[]) => void): void {
     const self = this;
     this._executeSql(sql, params, optionalTransaction,
       (tx, rs) => { callBack(self._transformRs(rs)); });
@@ -932,7 +939,7 @@ export class DantiaSyncCliService {
     return true;
   }
 
-  private _buildInsertSQL(tableName: string, objToInsert: Object, attrList?: any[]): string {
+  private _buildInsertSQL(tableName: string, objToInsert: object, attrList?: any[]): string {
     let members;
     if (attrList) { members = attrList;
     } else { members = this._getAttributesList(tableName, objToInsert);  }
@@ -948,7 +955,7 @@ export class DantiaSyncCliService {
     return sql;
   }
 
-  private _buildUpdateSQL(tableName: string, objToUpdate: Object, attrList?: any[]): string {
+  private _buildUpdateSQL(tableName: string, objToUpdate: object, attrList?: any[]): string {
   /*ex UPDATE "nom de table" SET colonne 1 = [valeur 1], colonne 2 = [valeur 2] WHERE {condition}*/
     let members;
     let sql = 'UPDATE ' + tableName + ' SET ';
@@ -980,7 +987,7 @@ export class DantiaSyncCliService {
   }
 
 
-  private _getMembersValue(obj: Object, members: string[]): any[] {
+  private _getMembersValue(obj: object, members: string[]): any[] {
     const memberArray = [];
     members.forEach( member => {
       memberArray.push(obj[member]);
@@ -988,7 +995,7 @@ export class DantiaSyncCliService {
     return memberArray;
   }
 
-  private _getAttributesList(tableName: string, obj: Object, check?: any): any[] {
+  private _getAttributesList(tableName: string, obj: object, check?: any): any[] {
     const memberArray = [];
     const table = this._getTableToProcess(tableName);
     for (const elm in obj) {
@@ -1000,7 +1007,7 @@ export class DantiaSyncCliService {
     return memberArray;
   }
 
-  private _getMembersValueString(obj: Object, members: string[], separator: string): string {
+  private _getMembersValueString(obj: object, members: string[], separator: string): string {
     let result = '';
     for (let i = 0; i < members.length; i++) {
         result += '"' + obj[members[i]] + '"';
@@ -1014,8 +1021,8 @@ export class DantiaSyncCliService {
   private _sendDataToServer(dataToSync: DataToSync, callBack: (serverResponse: DataFromServer) => void): void {
     const self = this;
 
-    let XHR = new XMLHttpRequest();
-    let data = JSON.stringify(dataToSync);
+    const XHR = new XMLHttpRequest();
+    const data = JSON.stringify(dataToSync);
     XHR.overrideMimeType('application/json;charset=UTF-8');
 
     if (self.username !== null && self.password !== null &&
@@ -1042,7 +1049,7 @@ export class DantiaSyncCliService {
             }
             try {
                 serverAnswer = JSON.parse(XHR.responseText);
-            } catch(e) {
+            } catch (e) {
                 serverAnswer = XHR.responseText;
             }
             self.log('Server answered: ');
@@ -1065,7 +1072,7 @@ export class DantiaSyncCliService {
     };
 
     XHR.ontimeout = () => {
-        let serverAnswer = {
+        const serverAnswer = {
             result : 'ERROR',
             message : 'Server Time Out',
             status : XHR.status,
@@ -1135,13 +1142,27 @@ export class DantiaSyncCliService {
       });
   }
 
-  private _getDDLTable (table: string, optionalTransaction, callback: (response: string) => void) {
+  private _getDDLTable(table: string, optionalTransaction, callback: (response: string) => void) {
     const self = this;
     const sql = 'select sql from sqlite_master where type=\'table\' and name=\'' + table + '\'';
     self._selectSql(sql, [], optionalTransaction, (rs) => { callback(rs[0]); });
   }
 
-  private _progressRatio (nbIx: number, nbCompleted: number, nbPending): number {
+  private checkModelsList(tableList: string[] | string): string[] {
+    let listToCheck = [];
+    if (tableList instanceof Array) {
+      listToCheck = tableList;
+    } else {
+      listToCheck = tableList.split(',');
+    }
+    if (listToCheck.some( (t) => this.tablesToSync.indexOf(t) !== -1 ) ) {
+      return listToCheck;
+    } else {
+      throw new Error ('Any item in the list is invalid.');
+    }
+  }
+
+  private _progressRatio(nbIx: number, nbCompleted: number, nbPending): number {
     const nbTables = this.tablesToSync.length;
     return Math.round( (nbTables - (nbCompleted + nbPending) + nbIx) / nbTables * 100);
   }
@@ -1158,12 +1179,12 @@ export class DantiaSyncCliService {
         chr1 = input.charCodeAt(i++);
         chr2 = input.charCodeAt(i++);
         chr3 = input.charCodeAt(i++);
-
+        // tslint:disable:no-bitwise
         enc1 = chr1 >> 2;
         enc2 = ((chr1 & 3) << 4) | (chr2 >> 4);
         enc3 = ((chr2 & 15) << 2) | (chr3 >> 6);
         enc4 = chr3 & 63;
-
+        // tslint:enable:no-bitwise
         if (isNaN(chr2)) {
             enc3 = enc4 = 64;
         } else if (isNaN(chr3)) {
@@ -1186,20 +1207,18 @@ private _utf8_encode(input: string): string {
     for (let n = 0; n < input.length; n++) {
 
         const c = input.charCodeAt(n);
-
+        // tslint:disable:no-bitwise
         if (c < 128) {
             utftext += String.fromCharCode(c);
-        }
-        else if((c > 127) && (c < 2048)) {
+        } else if ((c > 127) && (c < 2048)) {
             utftext += String.fromCharCode((c >> 6) | 192);
             utftext += String.fromCharCode((c & 63) | 128);
-        }
-        else {
+        } else {
             utftext += String.fromCharCode((c >> 12) | 224);
             utftext += String.fromCharCode(((c >> 6) & 63) | 128);
             utftext += String.fromCharCode((c & 63) | 128);
         }
-
+        // tslint:enable:no-bitwise
     }
 
     return utftext;

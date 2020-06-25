@@ -26,7 +26,7 @@ export interface SqlResultSet {
 
 export interface SqlResultSetRowList {
   length: number;
-  item(index: number): Object;
+  item(index: number): object;
 }
 
 export interface SqlError {
@@ -46,10 +46,11 @@ export interface TableToSync {
   ddl: string;
 }
 
+
 export interface SyncInfo {
   uuid: string;
   version: string;
-  lastSyncDate: number;
+  lastSyncDate: object;
   appName?: string;
   sizeMax?: number;
   username?: string;
@@ -86,8 +87,8 @@ export interface SyncResult {
 
 export interface DataToSync {
   info: SyncInfo;
-  data: Object;
-  delete_elem: Object;
+  data: object;
+  delete_elem: object;
 }
 
 export interface ProgressData {
