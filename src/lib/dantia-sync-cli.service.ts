@@ -343,14 +343,17 @@ export class DantiaSyncCliService {
     const self = this;
     this.log('_getDataToBackup');
     const dataToSync: DataToSync = {
-        info: this.syncInfo,
+        info: JSON.parse(JSON.stringify(this.syncInfo)),
         data: {},
         delete_elem: {}
     };
+    delete dataToSync.info.lastSyncDate;
     self.db.readTransaction( (tx: SqlTransaction) => {
       let counter = 0;
       const nbTables = modelsToBck.length;
+      dataToSync.info.lastSyncDate = {};
       modelsToBck.forEach((tableName: string) => { // a simple for will not work here because we have an asynchronous call inside
+        dataToSync.info.lastSyncDate[tableName] = this.syncInfo.lastSyncDate[tableName];
         const currTable: TableToSync = self._getTableToProcess(tableName);
         this._getDataToSavDel(currTable.tableName, currTable.idName, this.firstSync[currTable.tableName], tx, data => {
           dataToSync.data[tableName] = data;
