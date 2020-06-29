@@ -12,8 +12,7 @@ export class DantiaSyncCliService {
   private tablesToSync: TableToSync[]  = [];
   private idNameFromTableName = {};
   private sizeMax = 1048576;
-  private firstSync: boolean;
-  private firstSyncDate = 0;
+  private firstSync: any;
   private clientData;
   private serverData;
   private SqlTranError: SqlTransactionError;
@@ -35,6 +34,7 @@ export class DantiaSyncCliService {
     this.db = dbWrp.db;
     this.schema = dbWrp.schema;
     this.syncInfo = {uuid: '', version: '0', lastSyncDate: {}};
+    this.firstSync = {};
     let temp = Observable.create( observer => {
       this.progressObserver = observer;
     });
@@ -167,7 +167,6 @@ export class DantiaSyncCliService {
           this.callBackProgress('Getting local data to backup', 0, 'getData');
 
           self.syncDate = Math.round(new Date().getTime() / 1000.0);
-          self.firstSyncDate = 0;
           self._syncNowGo(modelsToBackup, this.callBackProgress, saveBandwidth);
       }
     });
@@ -218,11 +217,12 @@ export class DantiaSyncCliService {
               if (res.length === 0) {
                 this._executeSql('INSERT OR REPLACE INTO sync_info (table_name, last_sync) VALUES (?,?)', [curr.tableName, 0], tx);
               }
-              this.firstSync = true;
+              this.firstSync[curr.tableName] = true;
               this.syncInfo.lastSyncDate[curr.tableName] = 0;
             } else {
+              this.firstSync[curr.tableName] = false;
               this.syncInfo.lastSyncDate[curr.tableName] = res[0];
-              if (this.syncInfo.lastSyncDate[curr.tableName] === 0) { this.firstSync = true; }
+              if (this.syncInfo.lastSyncDate[curr.tableName] === 0) { this.firstSync[curr.tableName] = true; }
             }
           });
         });
@@ -272,60 +272,66 @@ export class DantiaSyncCliService {
               self.cbEndSync();
           } else {
               callBackProgress('Updating local data', 70, 'updateData');
-              if (serverData.models.pendiente.length > 0 && self.firstSyncDate === 0) {
-                  self.firstSyncDate = serverData.syncDate;
-              }
               if (serverData.data.delete_elem) {
                   self.syncResult.nbDeleted = serverData.data.delete_elem.length;
               }
-              if (self.firstSync) {
-                  self._updateFirstLocalDb(serverData, (sqlErrs: SqlError[]) => {
-                    if (sqlErrs) {
-                      self.syncResult.localDataUpdated = self.syncResult.nbUpdated > 0;
-                      self.syncResult.syncOK = false;
-                      self.syncResult.codeStr = 'syncKoData';
-                      self.syncResult.message = `errors found (${sqlErrs.length}) `;
-                      sqlErrs.forEach(err => { self.syncResult.message += err.message + ' '; });
-                      self.syncResult.serverAnswer = serverData; // include the original server answer, just in case
-                      self.cbEndSync();
-                    } else if (serverData.models.pendiente.length === 0)  {
-                      self.syncResult.localDataUpdated = self.syncResult.nbUpdated > 0;
-                      self.syncResult.syncOK = true;
-                      self.syncResult.codeStr = 'syncOk';
-                      self.syncResult.message = 'First load synchronized successfully. (' + self.syncResult.nbSent +
-                          ' new/modified element saved, ' + self.syncResult.nbUpdated + ' updated and ' +
-                          self.syncResult.nbDeleted + ' deleted elements.)';
-                      self.syncResult.serverAnswer = serverData; // include the original server answer, just in case
-                      self.cbEndSync();
-                    } else {
-                      self._syncNowGo(serverData.models.pendiente, callBackProgress, saveBandwidth);
-                    }
-
-                  }, callBackProgress);
-              } else {
-                  self._updateLocalDb(serverData, (sqlErrs: SqlError[]) => {
-                    if (sqlErrs) {
-                      self.syncResult.localDataUpdated = self.syncResult.nbUpdated > 0;
-                      self.syncResult.syncOK = false;
-                      self.syncResult.codeStr = 'syncKoData';
-                      self.syncResult.message = `errors found (${sqlErrs.length}) `;
-                      sqlErrs.forEach(err => { self.syncResult.message += err.message + ' '; });
-                      self.syncResult.serverAnswer = serverData; // include the original server answer, just in case
-                      self.cbEndSync();
-                    } else if (serverData.models.pendiente.length === 0)  {
-                      self.syncResult.localDataUpdated = self.syncResult.nbUpdated > 0;
-                      self.syncResult.syncOK = true;
-                      self.syncResult.codeStr = 'syncOk';
-                      self.syncResult.message = 'Data synchronized successfully. (' + self.syncResult.nbSent +
-                          ' new/modified element saved, ' + self.syncResult.nbUpdated + ' updated and ' +
-                          self.syncResult.nbDeleted + ' deleted elements.)';
-                      self.syncResult.serverAnswer = serverData; // include the original server answer, just in case
-                      self.cbEndSync();
-                    } else {
-                      self._syncNowGo(serverData.models.pendiente, callBackProgress, saveBandwidth);
-                    }
-                  }, callBackProgress);
+              if (typeof serverData.data === 'undefined' || serverData.data.length === 0) {
+                // nothing to update
+                // We only use the server date to avoid dealing with wrong date from the client
+                self.syncResult.localDataUpdated = self.syncResult.nbUpdated > 0;
+                self.syncResult.syncOK = true;
+                self.syncResult.codeStr = 'syncOk';
+                self.syncResult.message = 'First load synchronized successfully. (' + self.syncResult.nbSent +
+                    ' new/modified element saved, ' + self.syncResult.nbUpdated + ' updated and ' +
+                    self.syncResult.nbDeleted + ' deleted elements.)';
+                self.syncResult.serverAnswer = serverData; // include the original server answer, just in case
+                self.cbEndSync();
+                return;
               }
+              let sqlErrs: SqlError[] = [];
+              let counterNbTable = 0;
+              self.serverData = serverData;
+              const nbTables = serverData.models.completado.length;
+              const nbTablesPdte = serverData.models.pendiente.length;
+              const callFinishUpdate =  (table: any, method: string, sqlTableErrs?: SqlError[]) => {
+                if (sqlTableErrs) { sqlErrs = sqlErrs.concat(sqlTableErrs); }
+                counterNbTable++;
+                const perProgress = this._progressRatio(counterNbTable, nbTables, nbTablesPdte);
+                this.log(`${table.tableName} finish,  percent: ${perProgress.toString()}`);
+                callBackProgress(table.tableName, perProgress, method);
+                if (counterNbTable === nbTables) {
+                  if (sqlErrs.length > 0) {
+                    self.syncResult.localDataUpdated = self.syncResult.nbUpdated > 0;
+                    self.syncResult.syncOK = false;
+                    self.syncResult.codeStr = 'syncKoData';
+                    self.syncResult.message = `errors found (${sqlErrs.length}) `;
+                    sqlErrs.forEach(err => { self.syncResult.message += err.message + ' '; });
+                    self.syncResult.serverAnswer = serverData; // include the original server answer, just in case
+                    self.cbEndSync();
+                  } else if (serverData.models.pendiente.length === 0)  {
+                    self.syncResult.localDataUpdated = self.syncResult.nbUpdated > 0;
+                    self.syncResult.syncOK = true;
+                    self.syncResult.codeStr = 'syncOk';
+                    self.syncResult.message = 'First load synchronized successfully. (' + self.syncResult.nbSent +
+                        ' new/modified element saved, ' + self.syncResult.nbUpdated + ' updated and ' +
+                        self.syncResult.nbDeleted + ' deleted elements.)';
+                    self.syncResult.serverAnswer = serverData; // include the original server answer, just in case
+                    self.cbEndSync();
+                  } else {
+                    self._syncNowGo(serverData.models.pendiente, callBackProgress, saveBandwidth);
+                  }
+                }
+              };
+              serverData.models.completado.forEach(tableName => {
+                const table = this._getTableToProcess(tableName);
+                const currData = serverData.data[table.tableName] || [];
+                const deleData = serverData.data.delete_elem[table.tableName] || [];
+                if (this.firstSync[table.tableName]) {
+                  self._updateFirstLocalDb({ table, currData }, callFinishUpdate);
+                } else {
+                  self._updateLocalDb({ table, currData, deleData }, callFinishUpdate);
+                }
+              });
           }
         });
     });
@@ -346,7 +352,7 @@ export class DantiaSyncCliService {
       const nbTables = modelsToBck.length;
       modelsToBck.forEach((tableName: string) => { // a simple for will not work here because we have an asynchronous call inside
         const currTable: TableToSync = self._getTableToProcess(tableName);
-        this._getDataToSavDel(currTable.tableName, currTable.idName, this.firstSync, tx, data => {
+        this._getDataToSavDel(currTable.tableName, currTable.idName, this.firstSync[currTable.tableName], tx, data => {
           dataToSync.data[tableName] = data;
           nbData += data.length;
           counter++;
@@ -369,13 +375,8 @@ export class DantiaSyncCliService {
   private _finishSync(tableName: string, syncDate: number,  callBack?: () => void): void {
     this.firstSync = false;
     this.db.transaction( (tx: SqlTransaction) => {
-      if (this.firstSyncDate !== 0) {
-          this.syncInfo.lastSyncDate[tableName] = this.firstSyncDate;
-          this._executeSql('UPDATE sync_info SET last_sync = ? where  table_name = ?', [this.firstSyncDate, tableName], tx);
-      } else {
-          this.syncInfo.lastSyncDate[tableName] = syncDate;
-          this._executeSql('UPDATE sync_info SET last_sync = ? where  table_name = ?', [syncDate, tableName], tx);
-      }
+      this.syncInfo.lastSyncDate[tableName] = syncDate;
+      this._executeSql('UPDATE sync_info SET last_sync = ? where  table_name = ?', [syncDate, tableName], tx);
       // Remove only the elem sent to the server (in case new_elem has been added during the sync)
       // We don't do that anymore: this._executeSql('DELETE FROM new_elem', [], tx);
 
@@ -409,11 +410,11 @@ export class DantiaSyncCliService {
       this._errorHandler(undefined, err);
       delete this.clientData.data[tableName]; // this.clientData = null;
       delete this.serverData.data[tableName];  // this.serverData = null;
-      callBack();
+      if (callBack) { callBack(); }
     }, () => {
       delete this.clientData.data[tableName]; // this.clientData = null;
       delete this.serverData.data[tableName];  // this.serverData = null;
-      callBack();
+      if (callBack) { callBack(); }
     });
   }
 
@@ -431,7 +432,7 @@ export class DantiaSyncCliService {
   }
 
   private _getDataToSavDel(tableName: string, idName: string, needAllData: boolean, tx: SqlTransaction,
-                           dataCallBack: (data: Object[]) => void ): void {
+                           dataCallBack: (data: object[]) => void ): void {
     const sql = 'select distinct op.TipoOper, op.IdOper , c.* ' +
         'from ( ' +
         'select id IdOper, "U" TipoOper, change_time ' +
@@ -511,150 +512,90 @@ export class DantiaSyncCliService {
     });
   }
 
-  private _updateLocalDb(serverData: any, callBack: (sqlErrs?: SqlError[]) => void,
-                         callBackProgress: (message: string, percent: number, position: string) => void): void {
-
-    const self = this;
-    self.serverData = serverData;
+  private _updateLocalDb(serverData: any, callBack: (table: any, method: string, sqlErrs?: SqlError[]) => void): void {
     const sqlErrs: SqlError[] = [];
-    if (typeof serverData.data === 'undefined' || serverData.data.length === 0) {
-        // nothing to update
-        callBack();
-        return;
-    }
-    let counterNbTable = 0;
-    const nbTables = serverData.models.completado.length;
-    const nbTablesPdte = serverData.models.pendiente.length;
+    const table = serverData.table;
+    const currData = serverData.currData;
+    const deleData = serverData.deleData;
     let counterNbElm = 0;
-    serverData.models.completado.forEach(tableName => {
-      const table = self._getTableToProcess(tableName);
-      let sqlErrsTable = false;
-      let currData = serverData.data[table.tableName];
-      let deleData = serverData.data.delete_elem[table.tableName];
+    const nb = currData.length;
+    const nbDel = deleData.length;
+    counterNbElm += nb;
+    this.log(`There are ${nb} new or modified elements and ${nbDel} deleted, in the table ${table.tableName}to save in the local DB`);
+    let counterNbElmTab = 0;
 
-      if (!currData) {
-          // Should always be defined (even if 0 elements)
-          // Must not be null
-          currData = [];
+    const callOperation = (err: SqlError) => {
+      counterNbElmTab++;
+      if (err) { sqlErrs.push(err); }
+      if (counterNbElmTab === nb ) {
+        this._finishSync(table.tableName, this.serverData.syncDate);
       }
-      if (!deleData) {  deleData = [];   }
-      const nb = currData.length;
-      const nbDel = deleData.length;
-      counterNbElm += nb;
-      self.log(`There are ${nb} new or modified elements and ${nbDel} deleted, in the table ${table.tableName}to save in the local DB`);
-      let counterNbElmTab = 0;
+    };
 
-      self.db.transaction((tx: SqlTransaction) => {
-        self._deleteTableLocalDb (table.tableName, table.idName, deleData, tx,  () => {
-          const listIdToCheck = [];
-          if (nb !== 0) {
-            for (let i = 0; i < nb; i++) {
-                listIdToCheck.push(currData[i][table.idName]);
-            }
-            self._getIdExitingInDB(table.tableName, table.idName, listIdToCheck, tx, idInDb => {
-              let curr;
-              for (let i = 0; i < nb; i++) {
-                curr = currData[i];
-
-                if (idInDb.indexOf(curr[table.idName]) !== -1) {// update
-                    self._updateRecord(table.tableName, table.idName, curr, tx, (err) => {
-                      counterNbElmTab++;
-                      if (err) { sqlErrs.push(err); sqlErrsTable = true; }
-                      if (counterNbElmTab === nb && !sqlErrsTable ) {
-                        self._finishSync(table.tableName, serverData.syncDate);
-                      }
-                    });
-                } else {// insert
-                  self._insertRecord(table.tableName, table.idName, curr, tx, (err) => {
-                      counterNbElmTab++;
-                      if (err) { sqlErrs.push(err); sqlErrsTable = true; }
-                      if (counterNbElmTab === nb && !sqlErrsTable) {
-                        self._finishSync(table.tableName, serverData.syncDate);
-                      }
-                  });
-                }
-
-              } // end for
-            }); // end getExisting Id
+    this.db.transaction((tx: SqlTransaction) => {
+      this._deleteTableLocalDb (table.tableName, table.idName, deleData, tx,  () => {
+        const listIdToCheck = [];
+        if (nb !== 0) {
+          for (let i = 0; i < nb; i++) {
+              listIdToCheck.push(currData[i][table.idName]);
           }
-        }); // end delete elements
-      }, (err) => {
-        counterNbTable++;
-        sqlErrs.push(self.SqlTranError);
-        if (counterNbTable === nbTables) {  callBack(sqlErrs);   }
-      }, () => {
-        counterNbTable++;
-        const perProgress = this._progressRatio(counterNbTable, nbTables, nbTablesPdte);
-        this.syncResult.nbUpdated += counterNbElmTab;
-        this.log(`TransactionFinish: ${table.tableName} percent: ${perProgress.toString()}`);
-        callBackProgress(table.tableName, perProgress, 'updateLocalDB');
-        if (counterNbTable === nbTables) {
-          if (sqlErrs.length === 0) { callBack(); } else { callBack(sqlErrs); }
+          this._getIdExitingInDB(table.tableName, table.idName, listIdToCheck, tx, idInDb => {
+            let curr;
+            for (let i = 0; i < nb; i++) {
+              curr = currData[i];
+
+              if (idInDb.indexOf(curr[table.idName]) !== -1) {// update
+                this._updateRecord(table.tableName, table.idName, curr, tx, callOperation);
+              } else {// insert
+                this._insertRecord(table.tableName, table.idName, curr, tx, callOperation);
+              }
+
+            } // end for
+          }); // end getExisting Id
         }
-      }); // end tx
-    }); // end forEach
+      }); // end delete elements
+    }, (err) => {
+      this.log(`TransactionError (${table.tableName}): ${err.message}`);
+      sqlErrs.push(err);
+      this._errorHandler(undefined, err);
+      callBack(table, 'updateLocalDb', sqlErrs);
+    }, () => {
+      if (sqlErrs.length === 0) { callBack(table, 'updateLocalDb'); } else { callBack(table, 'updateLocalDb', sqlErrs); }
+    }); // end tx
   }
 
-  private _updateFirstLocalDb(serverData: any, callBack: (sqlErrs?: SqlError[]) => void,
-                              callBackProgress: (message: string, percent: number, position: string) => void): void {
-    this.serverData = serverData;
+  private _updateFirstLocalDb(serverData: any, callBack: (table: any, method: string, sqlErrs?: SqlError[]) => void): void {
     const sqlErrs: SqlError[] = [];
-
-    if (typeof serverData.data === 'undefined' || serverData.data.length === 0) {
-        // nothing to update
-        // We only use the server date to avoid dealing with wrong date from the client
-        callBack();
-        return;
-    }
-    let counterNbTable = 0;
-    const nbTables = serverData.models.completado.length;
-    const nbTablesPdte = serverData.models.pendiente.length;
+    const table = serverData.table;
+    const currData = serverData.currData;
     let counterNbElm = 0;
+    const nb = currData.length;
+    counterNbElm += nb;
+    this.log('There are ' + nb + ' new elements, in the table ' + table.tableName + ' to save in the local DB');
 
-    serverData.models.completado.forEach(tableName => {
-        const table = this._getTableToProcess(tableName);
-        let currData = serverData.data[table.tableName];
-        let sqlErrsTable = false;
-        if (!currData) {
-            // Should always be defined (even if 0 elements)
-            // Must not be null
-            currData = [];
-        }
-        const nb = currData.length;
-        counterNbElm += nb;
-        this.log('There are ' + nb + ' new elements, in the table ' + table.tableName + ' to save in the local DB');
-
-        let counterNbElmTab = 0;
-        this.db.transaction ( (tx: SqlTransaction) => {
-          if (nb !== 0) {
-            for (let i = 0; i < nb; i++) {
-              this._insertRecord(table.tableName, table.idName, currData[i], tx, (err) => {
-                counterNbElmTab++;
-                if (err) { sqlErrs.push(err); sqlErrsTable = true; }
-                if (counterNbElmTab === nb && !sqlErrsTable) {
-                  this._finishSync(table.tableName, serverData.syncDate);
-                }
-              });
+    let counterNbElmTab = 0;
+    this.db.transaction ( (tx: SqlTransaction) => {
+      if (nb !== 0) {
+        for (let i = 0; i < nb; i++) {
+          this._insertRecord(table.tableName, table.idName, currData[i], tx, (err) => {
+            counterNbElmTab++;
+            if (err) { sqlErrs.push(err); }
+            if (counterNbElmTab === nb) {
+              this._finishSync(table.tableName, this.serverData.syncDate);
             }
-          }
-        }, (err) => {
-          counterNbTable++;
-          sqlErrs.push(err);
-          this.log(`TransactionError: ${err.message}`);
-          this._errorHandler(undefined, err);
-          if (counterNbTable === nbTables) {  callBack(sqlErrs);   }
-        }, () => {
-          counterNbTable++;
-          const perProgress = this._progressRatio(counterNbTable, nbTables, nbTablesPdte);
-          this.syncResult.nbUpdated += counterNbElmTab;
+          });
+        }
+      }
+    }, (err) => {
+      this.log(`TransactionError (${table.tableName}): ${err.message}`);
+      sqlErrs.push(err);
+      this._errorHandler(undefined, err);
+      callBack(table, 'updateFirstLocalDb', sqlErrs);
+    }, () => {
+      this.syncResult.nbUpdated += counterNbElmTab;
+      if (sqlErrs.length === 0) { callBack(table, 'updateFirstLocalDb'); }  else { callBack(table, 'updateFirstLocalDb', sqlErrs); }
+    });
 
-          this.log(`TransactionFinish: ${table.tableName}  percent: ${perProgress.toString()}`);
-          callBackProgress(table.tableName, perProgress, 'updateFirstLocalDb');
-          if (counterNbTable === nbTables) {
-            if (sqlErrs.length === 0) { callBack(); }  else { callBack(sqlErrs); }
-          }
-        });
-    }); // end forEach
   }
 
   private _insertRecord(tableName: string, idName: string, reg: object, tx: SqlTransaction, callBack?: (sqlErr?: SqlError) => void) {
@@ -724,7 +665,7 @@ export class DantiaSyncCliService {
   }
 
   private _transformRs(rs: SqlResultSet): object[] {
-    let elms = [];
+    const elms = [];
     if (typeof rs.rows === 'undefined') {
         return elms;
     }
@@ -1053,7 +994,7 @@ export class DantiaSyncCliService {
                 serverAnswer = XHR.responseText;
             }
             self.log('Server answered: ');
-            self.log(JSON.stringify({result:serverAnswer.result, message:serverAnswer.message}));
+            self.log(JSON.stringify({result: serverAnswer.result, message: serverAnswer.message}));
             // I want only json/object as response
             if ((XHR.status === 200) && serverAnswer instanceof Object) {
                 callBack(serverAnswer);
@@ -1098,7 +1039,7 @@ export class DantiaSyncCliService {
     XHR.timeout = 60000;
     XHR.setRequestHeader('Content-type', 'application/json; charset=utf-8');
 
-    if (self.username !== null && self.password !== null && self.username !== undefined && self.password !== undefined ){
+    if (self.username !== null && self.password !== null && self.username !== undefined && self.password !== undefined ) {
       XHR.open('POST', self.serverUrl.replace('sync', 'conflict'), true);
       XHR.setRequestHeader('Authorization', 'Basic ' + self._encodeBase64(self.username + ':' + self.password));
     } else {
@@ -1150,15 +1091,16 @@ export class DantiaSyncCliService {
 
   private checkModelsList(tableList: string[] | string): string[] {
     let listToCheck = [];
+    const tablesToSync = this.tablesToSync.map( t => t.tableName);
     if (tableList instanceof Array) {
       listToCheck = tableList;
     } else {
       listToCheck = tableList.split(',');
     }
-    if (listToCheck.some( (t) => this.tablesToSync.indexOf(t) !== -1 ) ) {
-      return listToCheck;
-    } else {
+    if (listToCheck.some( (t) => tablesToSync.indexOf(t) === -1 ) ) {
       throw new Error ('Any item in the list is invalid.');
+    } else {
+      return listToCheck;
     }
   }
 
@@ -1169,6 +1111,7 @@ export class DantiaSyncCliService {
 
   private _encodeBase64(input: string): string {
     let output = '';
+    // tslint:disable-next-line:one-variable-per-declaration
     let chr1, chr2, chr3, enc1, enc2, enc3, enc4;
     let i = 0;
 
@@ -1201,7 +1144,7 @@ export class DantiaSyncCliService {
 }
 
 private _utf8_encode(input: string): string {
-    input = input.replace(/\r\n/g,'\n');
+    input = input.replace(/\r\n/g, '\n');
     let utftext = '';
 
     for (let n = 0; n < input.length; n++) {
