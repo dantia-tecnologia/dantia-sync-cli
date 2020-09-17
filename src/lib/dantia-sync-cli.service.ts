@@ -93,11 +93,23 @@ export class DantiaSyncCliService {
     }
   }
 
-  getLastSyncdate(tableName: string): number {
-    if (this.syncInfo.lastSyncDate.hasOwnProperty(tableName)) {
-      return this.syncInfo.lastSyncDate[tableName];
+  getLastSyncDate(tableName?: string): number {
+    if (tableName) {
+      if (this.syncInfo.lastSyncDate.hasOwnProperty(tableName)) {
+        return this.syncInfo.lastSyncDate[tableName];
+      } else {
+        throw new Error(`${tableName} not found.`);
+      }
     } else {
-      throw new Error(`${tableName} not found.`);
+      let arrLastSyncDate = Object.values(this.syncInfo.lastSyncDate);
+      arrLastSyncDate = arrLastSyncDate.filter( (elem: number) => { if (elem !== 0) { return elem; } });
+      if (arrLastSyncDate.length === 0) {
+        return 0;
+      } else {
+        return arrLastSyncDate.reduce( (minLast: number, lastSync: number) => {
+          if (minLast > lastSync) { return lastSync; } else { return minLast; }
+        }, Math.round(+new Date(2050, 11, 31) / 1000));
+      }
     }
   }
 
