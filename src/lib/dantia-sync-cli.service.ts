@@ -567,7 +567,7 @@ export class DantiaSyncCliService {
 
             } // end for
           }); // end getExisting Id
-        }
+        } else  { this._finishSync(table.tableName, this.serverData.syncDate); }
       }); // end delete elements
     }, (err) => {
       this.log(`TransactionError (${table.tableName}): ${err.message}`);
