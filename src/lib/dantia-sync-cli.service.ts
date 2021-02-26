@@ -458,8 +458,8 @@ export class DantiaSyncCliService {
         'from delete_elem ' +
         'where table_name= ? AND change_time <= ? ' +
         ' order by change_time) op ' +
-        'left join ' + tableName + ' c on c.idsync = op.IdOper ' +
-        'where (TipoOper="U" and idsync is not null) or TipoOper="D" ' +
+        'left join ' + tableName + ' c on c.' + idName + ' = op.IdOper ' +
+        'where (TipoOper="U" and ' + idName + ' is not null) or TipoOper="D" ' +
         'order by change_time, TipoOper';
 
     this._selectSql(sql, [tableName, this.syncDate, tableName, this.syncDate], tx, dataCallBack);
