@@ -475,7 +475,7 @@ export class DantiaSyncCliService {
   private _detectConflict(tableName: string, idValue: any, tx: SqlTransaction, callBack: (detect: boolean) => void): void  {
     let sql: string;
     const self = this;
-    if (!this.firstSync) {
+    if (!this.firstSync[tableName]) {
         sql = 'select DISTINCT id FROM new_elem ' +
               ' WHERE table_name = ?  AND id = ? AND change_time > ? ' +
               ' UNION ALL ' +
@@ -621,11 +621,11 @@ export class DantiaSyncCliService {
       (exists) => {
         if (!exists) {
 
-            // 'ex INSERT INTO tablename (id, name, type, etc) VALUES (?, ?, ?, ?);'
+            // 'ex INSERT INTO tableName (id, name, type, etc) VALUES (?, ?, ?, ?);'
             const attList = self._getAttributesList(tableName, reg);
             sql = self._buildInsertSQL(tableName, reg, attList);
             const attValue = self._getMembersValue(reg, attList);
-            if (!self.firstSync) {
+            if (!self.firstSync[tableName]) {
                 self._executeSql(sql, attValue, tx, () => {
                     sql = 'DELETE FROM new_elem WHERE ' +
                         'table_name = ? AND id = ? AND ' +
@@ -696,7 +696,7 @@ export class DantiaSyncCliService {
     return elms;
   }
 
-  private _deleteTableLocalDb(tablename: string, idName: string, listIdToDelete: any[],
+  private _deleteTableLocalDb(tableName: string, idName: string, listIdToDelete: any[],
                               tx: SqlTransaction, callBack: (final: boolean) => void): void {
 
     const listIds = [];
@@ -716,7 +716,7 @@ export class DantiaSyncCliService {
       );
 
       listIds.map((listIdsDel, ix, list) => {
-        this._deleteParcialTableLocalDb(tablename, idName, listIdsDel, tx, () => {
+        this._deleteParcialTableLocalDb(tableName, idName, listIdsDel, tx, () => {
           if (++orden === list.length) {
             callBack(true);
           }
@@ -725,18 +725,18 @@ export class DantiaSyncCliService {
     }
   }
 
-  private _deleteParcialTableLocalDb(tablename: string, idName: string, listIdToDelete: any[],
+  private _deleteParcialTableLocalDb(tableName: string, idName: string, listIdToDelete: any[],
                                      tx: SqlTransaction, callBack: (final: boolean) => void): void {
     const self = this;
 
-    let  sql = `delete from ${tablename} WHERE ${idName} IN (${listIdToDelete.map(x => '?').join(',')})`;
+    let  sql = `delete from ${tableName} WHERE ${idName} IN (${listIdToDelete.map(x => '?').join(',')})`;
     this._executeSql(sql, listIdToDelete, tx, () => {
-      sql = `delete from delete_elem WHERE table_name = "${tablename}" and id  IN (${listIdToDelete.map(x => '?').join(',')})`;
+      sql = `delete from delete_elem WHERE table_name = "${tableName}" and id  IN (${listIdToDelete.map(x => '?').join(',')})`;
       self._executeSql(sql, listIdToDelete, tx, () => {
         const reg = {};
         listIdToDelete.forEach( x => {
           reg[idName] = x;
-          self.dataObserver.next({table: tablename, record: reg, operation: DataOperation.Deleted});
+          self.dataObserver.next({table: tableName, record: reg, operation: DataOperation.Deleted});
         });
         callBack(true);
       });
