@@ -387,50 +387,40 @@ export class DantiaSyncCliService {
     });
   }
 
-  private _finishSync(tableName: string, syncDate: number,  callBack?: () => void): void {
+  private _finishSync(tableName: string, syncDate: number, tx: SqlTransaction): void {
+    var self = this;
     this.firstSync[tableName] = false;
-    this.db.transaction( (tx: SqlTransaction) => {
-      this.syncInfo.lastSyncDate[tableName] = syncDate;
-      this._executeSql('UPDATE sync_info SET last_sync = ? where  table_name = ?', [syncDate, tableName], tx);
-      // Remove only the elem sent to the server (in case new_elem has been added during the sync)
-      // We don't do that anymore: this._executeSql('DELETE FROM new_elem', [], tx);
+    this.syncInfo.lastSyncDate[tableName] = syncDate;
+    this._executeSql('UPDATE sync_info SET last_sync = ? where  table_name = ?', [syncDate, tableName], tx);
+    // Remove only the elem sent to the server (in case new_elem has been added during the sync)
+    // We don't do that anymore: this._executeSql('DELETE FROM new_elem', [], tx);
 
-      if (this.clientData.data.hasOwnProperty(tableName)) {
-        const idsNewToDelete = [];
-        const idsDelToDelete = [];
-        let idsString = '';
-        const idName =  this.idNameFromTableName[tableName];
-        this.clientData.data[tableName].forEach(reg => {
-            if (reg.TipoOper === 'U') {
-                idsNewToDelete.push(reg[idName]);
-            } else {
-                idsDelToDelete.push(reg.IdOper);
-            }
-        });
-        if (idsNewToDelete.length > 0) {
-          idsString = idsNewToDelete.map(x => '?').join(',');
-          this._executeSql(`DELETE FROM new_elem WHERE table_name ='${tableName}'
-              AND id IN (${idsString})
-              AND change_time <= ${syncDate}`, idsNewToDelete, tx);
-        }
-
-        if (idsDelToDelete.length > 0) {
-          idsString = idsDelToDelete.map(x => '?').join(',');
-          this._executeSql(`DELETE FROM delete_elem WHERE table_name = '${tableName}'
-              AND id IN (${idsString})
-              AND change_time <= ${syncDate}`, idsDelToDelete, tx);
-        }
+    if (this.clientData.data.hasOwnProperty(tableName)) {
+      const idsNewToDelete = [];
+      const idsDelToDelete = [];
+      let idsString = '';
+      const idName =  this.idNameFromTableName[tableName];
+      this.clientData.data[tableName].forEach(reg => {
+          if (reg.TipoOper === 'U') {
+              idsNewToDelete.push(reg[idName]);
+          } else {
+              idsDelToDelete.push(reg.IdOper);
+          }
+      });
+      if (idsNewToDelete.length > 0) {
+        idsString = idsNewToDelete.map(x => '?').join(',');
+        this._executeSql(`DELETE FROM new_elem WHERE table_name ='${tableName}'
+            AND id IN (${idsString})
+            AND change_time <= ${syncDate}`, idsNewToDelete, tx);
       }
-    }, (err: SqlError) => {
-      this._errorHandler(undefined, err);
-      delete this.clientData.data[tableName]; // this.clientData = null;
-      delete this.serverData.data[tableName];  // this.serverData = null;
-      if (callBack) { callBack(); }
-    }, () => {
-      delete this.clientData.data[tableName]; // this.clientData = null;
-      delete this.serverData.data[tableName];  // this.serverData = null;
-      if (callBack) { callBack(); }
-    });
+
+      if (idsDelToDelete.length > 0) {
+        idsString = idsDelToDelete.map(x => '?').join(',');
+        this._executeSql(`DELETE FROM delete_elem WHERE table_name = '${tableName}'
+            AND id IN (${idsString})
+            AND change_time <= ${syncDate}`, idsDelToDelete, tx);
+      }
+    }
   }
 
   private _getTableToProcess(tableName: string): TableToSync {
@@ -491,7 +481,7 @@ export class DantiaSyncCliService {
     }
   }
 
-  private _updateRecord(tableName: string, idName: string, reg: object, tx: SqlTransaction, callBack?: (sqlErr?: SqlError) => void ) {
+  private _updateRecord(tableName: string, idName: string, reg: object, tx: SqlTransaction, callBack?: (tx: SqlTransaction, sqlErr?: SqlError) => void ) {
     let sql: string;
     const self = this;
 
@@ -512,16 +502,16 @@ export class DantiaSyncCliService {
                 self._executeSql(sql, [tableName, reg[idName], tableName, reg[idName] ], tx,
                   () => {
                     self.dataObserver.next({table: tableName, record: reg, operation: DataOperation.Updated});
-                    callBack();
+                    callBack(tx);
                   },
                   (ts, error) => {
                     self._errorHandler(ts, error);
-                    callBack(error);
+                    callBack(tx, error);
                   });
             });
 
         } else {  // send conflict to server
-          callBack();
+          callBack(tx);
           self._sendConflict(tableName, idName, reg, tx);
         }
     });
@@ -539,11 +529,11 @@ export class DantiaSyncCliService {
     this.log(`There are ${nb} new or modified elements and ${nbDel} deleted, in the table ${table.tableName}to save in the local DB`);
     let counterNbElmTab = 0;
 
-    const callOperation = (err: SqlError) => {
+    const callOperation = (tx: SqlTransaction, err: SqlError ) => {
       counterNbElmTab++;
       if (err) { sqlErrs.push(err); }
       if (counterNbElmTab === nb ) {
-        this._finishSync(table.tableName, this.serverData.syncDate);
+        this._finishSync(table.tableName, this.serverData.syncDate, tx);
       }
     };
 
@@ -567,12 +557,14 @@ export class DantiaSyncCliService {
 
             } // end for
           }); // end getExisting Id
-        } else  { this._finishSync(table.tableName, this.serverData.syncDate); }
+        } else  { this._finishSync(table.tableName, this.serverData.syncDate, tx); }
       }); // end delete elements
     }, (err) => {
       this.log(`TransactionError (${table.tableName}): ${err.message}`);
       sqlErrs.push(err);
       this._errorHandler(undefined, err);
+      delete this.clientData.data[table.tableName]; // this.clientData = null;
+      delete this.serverData.data[table.tableName];  // this.serverData = null;
       callBack(table, 'updateLocalDb', sqlErrs);
     }, () => {
       if (sqlErrs.length === 0) { callBack(table, 'updateLocalDb'); } else { callBack(table, 'updateLocalDb', sqlErrs); }
@@ -592,14 +584,16 @@ export class DantiaSyncCliService {
     this.db.transaction ( (tx: SqlTransaction) => {
       if (nb !== 0) {
         for (let i = 0; i < nb; i++) {
-          this._insertRecord(table.tableName, table.idName, currData[i], tx, (err) => {
+          this._insertRecord(table.tableName, table.idName, currData[i], tx, (tx2, err) => {
             counterNbElmTab++;
             if (err) { sqlErrs.push(err); }
             if (counterNbElmTab === nb) {
-              this._finishSync(table.tableName, this.serverData.syncDate);
+              this._finishSync(table.tableName, this.serverData.syncDate, tx2);
             }
           });
         }
+      } else {
+        this._finishSync(table.tableName, this.serverData.syncdate, tx);
       }
     }, (err) => {
       this.log(`TransactionError (${table.tableName}): ${err.message}`);
@@ -613,7 +607,7 @@ export class DantiaSyncCliService {
 
   }
 
-  private _insertRecord(tableName: string, idName: string, reg: object, tx: SqlTransaction, callBack?: (sqlErr?: SqlError) => void) {
+  private _insertRecord(tableName: string, idName: string, reg: object, tx: SqlTransaction, callBack?: (tx: SqlTransaction, sqlErr?: SqlError) => void) {
     let sql: string;
     const self = this;
 
@@ -635,21 +629,21 @@ export class DantiaSyncCliService {
                     self._executeSql(sql, [tableName, reg[idName], tableName, reg[idName]], tx,
                       () => {
                         this.dataObserver.next({table: tableName, record: reg, operation: DataOperation.Inserted});
-                        callBack ();
+                        callBack (tx);
                       });
                 }, (ts, error) => {
                   self._errorHandler(ts, error);
-                  callBack(error);
+                  callBack(tx, error);
                 });
             } else {
                 self._executeSql(sql, attValue, tx,
                   () => {
                     this.dataObserver.next({table: tableName, record: reg, operation: DataOperation.Inserted});
-                    callBack ();
+                    callBack (tx);
                   },
                   (ts, error) => {
                     self._errorHandler(ts, error);
-                    callBack(error);
+                    callBack(tx, error);
                 });
             }
         } else {  // send conflict to server
