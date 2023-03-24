@@ -1,7 +1,8 @@
 import { Injectable } from '@angular/core';
 import { DbWrapperService, DBTable, DBSchema } from 'db-wrapper';
 import { SqlTransaction, SqlResultSet, DataToSync, SqlError, DataFromServer, ProgressData,
-  SyncInfo, SyncResult, TableToSync, DataRecord, DataOperation, SqlTransactionError } from './dantia-sync-cli.models';
+  SyncInfo, SyncResult, TableToSync, DataRecord, DataOperation, SqlTransactionError,
+  DataConflict } from './dantia-sync-cli.models';
 import { Observable } from 'rxjs';
 import { share} from 'rxjs/operators';
 
@@ -28,7 +29,7 @@ export class DantiaSyncCliService {
   public data$: Observable<DataRecord>;
   private dataObserver: any;
   private progressObserver: any;
-  public syncResult: SyncResult = null;
+  public syncResult: SyncResult;
 
   constructor(private dbWrp: DbWrapperService) {
     this.db = dbWrp.db;
@@ -78,17 +79,8 @@ export class DantiaSyncCliService {
         setTimeout(() => true, 500);
       });
     } else {
-      const pendientes =
-        [
-          new Promise ( resolve => {
-            this._selectSql('select count(*) from delete_elem', undefined, undefined, cont => { resolve(cont[0]); } );
-          }),
-          new Promise ( resolve => {
-            this._selectSql('select count(*) from new_elem', undefined, undefined, cont => { resolve(cont[0]); });
-          })
-        ];
-      return Promise.all(pendientes).then( (pdte: boolean[]) => {
-        if (pdte[0] || pdte[1]) { return true; } else { return false; }
+      return new Promise(resolve => {
+        this._selectSql('select count(*) from _change_elem', undefined, undefined, cont => { resolve(cont[0] > 0); } );
       });
     }
   }
@@ -116,7 +108,7 @@ export class DantiaSyncCliService {
   setSyncDate(tableName: string, val: number) {
     if (this.syncInfo.lastSyncDate.hasOwnProperty(tableName)) {
       this.syncInfo.lastSyncDate[tableName] = val;
-      this._executeSql('UPDATE sync_info SET last_sync = ? where table_name = ?', [val, tableName]);
+      this._executeSql('UPDATE _sync_info SET last_sync = ? where table_name = ?', [val, tableName]);
     } else {
       throw new Error(`${tableName} not found.`);
     }
@@ -136,7 +128,7 @@ export class DantiaSyncCliService {
 
   syncNow(modelsToSync?: string[] | string, saveBandwidth?: boolean): Observable<SyncResult> {
     const self = this;
-    let modelsToBackup = [];
+    let modelsToBackup: string[] = [];
     if (modelsToSync) {
       modelsToBackup = this.checkModelsList(modelsToSync);
     }
@@ -147,7 +139,8 @@ export class DantiaSyncCliService {
 
     return Observable.create ( observer => {
       self.cbEndSync = () => {
-        this.callBackProgress(self.syncResult.message, 100, self.syncResult.codeStr);
+        if (self.syncResult)
+          this.callBackProgress(self.syncResult.message, 100, self.syncResult.codeStr);
         const resultado = self.syncResult;
         self.syncResult = null;
         observer.next(resultado);
@@ -200,42 +193,55 @@ export class DantiaSyncCliService {
     }
     return new Promise( (resolve, reject) => {
       this.db.transaction( (tx: SqlTransaction) => {
-        this._executeSql('CREATE TABLE IF NOT EXISTS new_elem (table_name TEXT NOT NULL, id TEXT NOT NULL, ' +
-            'change_time TIMESTAMP NOT NULL DEFAULT  (strftime(\'%s\',\'now\')));', [], tx);
-        this._executeSql('CREATE INDEX IF NOT EXISTS index_tableName_newElem on new_elem (table_name)');
-        this._executeSql('CREATE TABLE IF NOT EXISTS delete_elem (table_name TEXT NOT NULL, id TEXT NOT NULL, ' +
-            'change_time TIMESTAMP NOT NULL DEFAULT  (strftime(\'%s\',\'now\')));', [], tx);
-        this._executeSql('CREATE INDEX IF NOT EXISTS index_tableName_deleteElem on delete_elem (table_name)');
-        this._executeSql('CREATE TABLE IF NOT EXISTS sync_info (table_name TEXT NOT NULL, last_sync TIMESTAMP);', [], tx);
+        this._executeSql('CREATE TABLE IF NOT EXISTS _change_elem (table_name TEXT NOT NULL, id TEXT NOT NULL, oper TEXT NOT NULL, ' +
+            'change_time TIMESTAMP NOT NULL DEFAULT  (strftime(\'%s\',\'now\')), data TEXT NULL);', [], tx);
+        this._executeSql('CREATE INDEX IF NOT EXISTS index_tableName_changeElem on _change_elem (table_name)');
+        this._executeSql('CREATE TABLE IF NOT EXISTS _sync_info (table_name TEXT NOT NULL, last_sync TIMESTAMP);', [], tx);
+        this._executeSql('CREATE INDEX IF NOT EXISTS index_tableName_syncInfo on _sync_info (table_name)');
 
-        // create triggers to automatically fill the new_elem table (this table will contains a pointer to all the modified data)
+        // create triggers to automatically fill the _change_elem table (this table will contains a pointer to all the modified data)
         this.tablesToSync.forEach(curr => {
-          this._executeSql('CREATE TRIGGER IF NOT EXISTS update_' + curr.tableName + '  AFTER UPDATE ON ' + curr.tableName + ' ' +
-                    'WHEN (SELECT last_sync FROM sync_info where table_name = \'' +  curr.tableName + '\') > 0 ' +
-                    'BEGIN INSERT INTO new_elem (table_name, id) VALUES ' +
-                    '("' + curr.tableName + '", new.' + curr.idName + '); END;', [], tx);
+          this._getListColumns(curr.tableName, tx, function(listColumns) {
+            this._executeSql('CREATE TRIGGER IF NOT EXISTS update_' + curr.tableName + '  AFTER UPDATE ON ' + curr.tableName + ' ' +
+                      'WHEN (SELECT last_sync FROM _sync_info where table_name = \'' +  curr.tableName + '\') > 0 ' +
+                      'BEGIN INSERT INTO _change_elem (table_name, id, oper) VALUES ' +
+                      '("' + curr.tableName + '", new.' + curr.idName + ', \'U\'); END;', [], tx);
 
-          this._executeSql('CREATE TRIGGER IF NOT EXISTS insert_' + curr.tableName + '  AFTER INSERT ON ' + curr.tableName + ' ' +
-                    'WHEN (SELECT last_sync FROM sync_info where table_name = \'' +  curr.tableName + '\') > 0 ' +
-                    'BEGIN INSERT INTO new_elem (table_name, id) VALUES ' +
-                    '("' + curr.tableName + '", new.' + curr.idName + '); END;', [], tx);
+            const dataInsert = '\'{\' ||'.concat(
+              listColumns.map(function(col) {
+                return 'case when new.'.concat(col.column, ' is null then \'"',col.column, '": null \' else ',
+                  '\'"',col.column, '":', (col.quoted?'"':''),'\' || new.',col.column,(col.quoted?' || \'"\' ':' || \'\''), ' end');
+                }).join(' || \',\' || '),' || \'}\''
+            );
+            this._executeSql('CREATE TRIGGER IF NOT EXISTS insert_' + curr.tableName + '  AFTER INSERT ON ' + curr.tableName + ' ' +
+                      'WHEN (SELECT last_sync FROM _sync_info where table_name = \'' +  curr.tableName + '\') > 0 ' +
+                      'BEGIN INSERT INTO _change_elem (table_name, id, oper, data) VALUES ' +
+                      '("' + curr.tableName + '", new.' + curr.idName + ', \'I\',' + dataInsert + '); END;', [], tx);
 
-          this._executeSql('CREATE TRIGGER IF NOT EXISTS delete_' + curr.tableName + '  AFTER DELETE ON ' + curr.tableName + ' ' +
-                    'BEGIN INSERT INTO delete_elem (table_name, id) VALUES ' +
-                    '("' + curr.tableName + '", old.' + curr.idName + '); END;', [], tx);
-          this._getDDLTable(curr.tableName, tx, (ddl) => { curr.ddl = ddl; });
-          this._selectSql('SELECT last_sync FROM sync_info where table_name = ?', [curr.tableName], tx, res => {
-            if (res.length === 0 || res[0] === 0) { // First sync (or data lost)
-              if (res.length === 0) {
-                this._executeSql('INSERT OR REPLACE INTO sync_info (table_name, last_sync) VALUES (?,?)', [curr.tableName, 0], tx);
+            const dataDelete =  '\'{\' ||'.concat(
+              listColumns.map(function(col) {
+                return 'case when old.'.concat(col.column, ' is null then \'"',col.column, '": null \' else ',
+                  '\'"',col.column, '":', (col.quoted?'"':''),'\' || old.',col.column,(col.quoted?' || \'"\' ':' || \'\''), ' end');
+              }).join(' || \',\' || '),' || \'}\''
+            );
+            this._executeSql('CREATE TRIGGER IF NOT EXISTS delete_' + curr.tableName + '  AFTER DELETE ON ' + curr.tableName + ' ' +
+                      'BEGIN INSERT INTO _change_elem (table_name, id, oper, data) VALUES ' +
+                      '("' + curr.tableName + '", old.' + curr.idName + ', \'D\',' + dataDelete + '); END;', [], tx);
+
+            this._getDDLTable(curr.tableName, tx, (ddl) => { curr.ddl = ddl; });
+            this._selectSql('SELECT last_sync FROM _sync_info where table_name = ?', [curr.tableName], tx, res => {
+              if (res.length === 0 || res[0] === 0) { // First sync (or data lost)
+                if (res.length === 0) {
+                  this._executeSql('INSERT OR REPLACE INTO _sync_info (table_name, last_sync) VALUES (?,?)', [curr.tableName, 0], tx);
+                }
+                this.firstSync[curr.tableName] = true;
+                this.syncInfo.lastSyncDate[curr.tableName] = 0;
+              } else {
+                this.firstSync[curr.tableName] = false;
+                this.syncInfo.lastSyncDate[curr.tableName] = res[0];
+                if (this.syncInfo.lastSyncDate[curr.tableName] === 0) { this.firstSync[curr.tableName] = true; }
               }
-              this.firstSync[curr.tableName] = true;
-              this.syncInfo.lastSyncDate[curr.tableName] = 0;
-            } else {
-              this.firstSync[curr.tableName] = false;
-              this.syncInfo.lastSyncDate[curr.tableName] = res[0];
-              if (this.syncInfo.lastSyncDate[curr.tableName] === 0) { this.firstSync[curr.tableName] = true; }
-            }
+            });
           });
         });
 
@@ -336,12 +342,14 @@ export class DantiaSyncCliService {
               };
               serverData.models.completado.forEach(tableName => {
                 const table = this._getTableToProcess(tableName);
-                const currData = serverData.data[table.tableName] || [];
-                const deleData = serverData.data.delete_elem[table.tableName] || [];
-                if (this.firstSync[table.tableName]) {
-                  self._updateFirstLocalDb({ table, currData }, callFinishUpdate);
-                } else {
-                  self._updateLocalDb({ table, currData, deleData }, callFinishUpdate);
+                if (table) {
+                  const currData = serverData.data[table.tableName] || [];
+                  const deleData = serverData.data.delete_elem[table.tableName] || [];
+                  if (this.firstSync[table.tableName]) {
+                    self._updateFirstLocalDb({ table, currData }, callFinishUpdate);
+                  } else {
+                    self._updateLocalDb({ table, currData, deleData }, callFinishUpdate);
+                  }
                 }
               });
           }
@@ -359,24 +367,32 @@ export class DantiaSyncCliService {
         data: {},
         delete_elem: {}
     };
-    delete dataToSync.info.lastSyncDate;
     self.db.readTransaction( (tx: SqlTransaction) => {
       let counter = 0;
       const nbTables = modelsToBck.length;
       dataToSync.info.lastSyncDate = {};
       modelsToBck.forEach((tableName: string) => { // a simple for will not work here because we have an asynchronous call inside
         dataToSync.info.lastSyncDate[tableName] = this.syncInfo.lastSyncDate[tableName];
-        const currTable: TableToSync = self._getTableToProcess(tableName);
-        this._getDataToSavDel(currTable.tableName, currTable.idName, this.firstSync[currTable.tableName], tx, data => {
-          dataToSync.data[tableName] = data;
-          nbData += data.length;
+        const currTable: TableToSync | undefined = self._getTableToProcess(tableName);
+        if (currTable) {
+          this._getDataToSavDel(currTable.tableName, currTable.idName, this.firstSync[currTable.tableName], tx, data => {
+            dataToSync.data[tableName] = data;
+            nbData += data.length;
+            counter++;
+            if (counter === nbTables) {
+              this.log('Data fetched from the local DB');
+              this.syncResult.nbSent += nbData;
+              dataCallBack(dataToSync);
+            }
+          });
+        } else {
           counter++;
           if (counter === nbTables) {
             this.log('Data fetched from the local DB');
             this.syncResult.nbSent += nbData;
             dataCallBack(dataToSync);
           }
-        });
+        }
       }); // end for each
 
     }, (err: SqlError) => {
@@ -391,44 +407,33 @@ export class DantiaSyncCliService {
     var self = this;
     this.firstSync[tableName] = false;
     this.syncInfo.lastSyncDate[tableName] = syncDate;
-    this._executeSql('UPDATE sync_info SET last_sync = ? where  table_name = ?', [syncDate, tableName], tx);
-    // Remove only the elem sent to the server (in case new_elem has been added during the sync)
-    // We don't do that anymore: this._executeSql('DELETE FROM new_elem', [], tx);
+    this._executeSql('UPDATE _sync_info SET last_sync = ? where  table_name = ?', [syncDate, tableName], tx);
 
     if (this.clientData.data.hasOwnProperty(tableName)) {
-      const idsNewToDelete = [];
-      const idsDelToDelete = [];
+      const idsDelToDelete: string[] = [];
       let idsString = '';
       const idName =  this.idNameFromTableName[tableName];
       this.clientData.data[tableName].forEach(reg => {
-          if (reg.TipoOper === 'U') {
-              idsNewToDelete.push(reg[idName]);
+        if (reg.TipoOper === 'U' || reg.TipoOper === 'I') {
+          idsDelToDelete.push(reg[idName]);
           } else {
               idsDelToDelete.push(reg.IdOper);
           }
       });
-      if (idsNewToDelete.length > 0) {
-        idsString = idsNewToDelete.map(x => '?').join(',');
-        this._executeSql(`DELETE FROM new_elem WHERE table_name ='${tableName}'
-            AND id IN (${idsString})
-            AND change_time <= ${syncDate}`, idsNewToDelete, tx);
-      }
 
       if (idsDelToDelete.length > 0) {
         idsString = idsDelToDelete.map(x => '?').join(',');
-        this._executeSql(`DELETE FROM delete_elem WHERE table_name = '${tableName}'
+        this._executeSql(`DELETE FROM _change_elem WHERE table_name = '${tableName}'
             AND id IN (${idsString})
             AND change_time <= ${syncDate}`, idsDelToDelete, tx);
       }
     }
   }
 
-  private _getTableToProcess(tableName: string): TableToSync {
-    let result: TableToSync;
-    this.tablesToSync.forEach( table => {
-        if (table.tableName === tableName) {
-            result = table;
-        }
+  private _getTableToProcess(tableName: string): TableToSync | undefined {
+
+    let result: TableToSync | undefined = this.tablesToSync.find( table => {
+        if (table.tableName === tableName) { return table;  }
     });
     if (!result) {
       this.error(tableName + ' no se encuentra entre las tablas a sincronizar.');
@@ -438,39 +443,39 @@ export class DantiaSyncCliService {
 
   private _getDataToSavDel(tableName: string, idName: string, needAllData: boolean, tx: SqlTransaction,
                            dataCallBack: (data: object[]) => void ): void {
-    const sql = 'select distinct op.TipoOper, op.IdOper , c.* ' +
-        'from ( ' +
-        'select id IdOper, "U" TipoOper, change_time ' +
-        'from new_elem ' +
-        'where table_name= ? AND change_time <= ? ' +
-        ' union ALL ' +
-        'select id IdOper, "D" TipoOper, change_time ' +
-        'from delete_elem ' +
-        'where table_name= ? AND change_time <= ? ' +
-        ' order by change_time) op ' +
-        'left join ' + tableName + ' c on c.' + idName + ' = op.IdOper ' +
-        'where (TipoOper="U" and ' + idName + ' is not null) or TipoOper="D" ' +
-        'order by change_time, TipoOper';
+      const sql = 'select distinct op.oper TipoOper, op.id IdOper, op.data, op.change_time DateOper, c.* ' +
+        'from ( select op.oper, op.id, max(op.change_time) change_time from  _change_elem op ' +
+        'where op.table_name= ? AND op.change_time <= ? group by op.oper, op.id) opmod ' +
+        'inner join _change_elem op on op.oper = opmod.oper and op.id = opmod.id ' +
+        '   and op.change_time = opmod.change_time ' +
+        'left join ' + tableName + ' c on c.' + idName + ' = op.id ' +
+        'where op.table_name= ? AND op.change_time <= ? ' +
+        'order by op.change_time, case when op.oper = \'I\' then 1 ' +
+        ' when op.oper = \'U\' then 2 when op.oper = \'D\' then 3 end' ;
 
-    this._selectSql(sql, [tableName, this.syncDate, tableName, this.syncDate], tx, dataCallBack);
-  }
-
-  private _getDataToDelete(tableName: string, tx: SqlTransaction, dataCallBack: (data: any[]) => void ): void {
-    const sql = 'select distinct id FROM delete_elem' +
-        ' WHERE table_name = ? AND change_time <= ?' +
-        ' ORDER BY change_time ';
-    this._selectSql(sql, [tableName, this.syncDate], tx, dataCallBack);
+      this._selectSql(sql, [tableName, this.syncDate, tableName, this.syncDate], tx, function(data) {
+        var result = data.map(function (elem) {
+          if (elem.TipoOper === 'I' || elem.TipoOper === 'D') {
+            var data = JSON.parse(elem.data);
+            Object.keys(data).forEach(function (field) {
+              if (Object.getOwnPropertyDescriptor(elem,field)) {
+                elem[field] = data[field];
+              }
+            });
+          }
+          delete elem.data;
+          return elem;
+        });
+        dataCallBack(result);
+      });
   }
 
   private _detectConflict(tableName: string, idValue: any, tx: SqlTransaction, callBack: (detect: boolean) => void): void  {
     let sql: string;
     const self = this;
     if (!this.firstSync[tableName]) {
-        sql = 'select DISTINCT id FROM new_elem ' +
-              ' WHERE table_name = ?  AND id = ? AND change_time > ? ' +
-              ' UNION ALL ' +
-              'select DISTINCT id FROM delete_elem ' +
-              ' WHERE table_name = ? AND id = ? AND change_time > ?';
+        sql = 'select DISTINCT id FROM _change_elem ' +
+          ' WHERE table_name = ?  AND id = ? AND change_time > ? ';
 
         self._selectSql(sql, [tableName, idValue, this.syncDate, tableName, idValue, this.syncDate], tx,
           (exists) => {
@@ -494,24 +499,24 @@ export class DantiaSyncCliService {
             const attValue = this._getMembersValue(reg, attList);
 
             self._executeSql(sql, [ ...attValue, reg[idName]], tx, () => {
-                sql = 'DELETE FROM new_elem WHERE ' +
+                sql = 'DELETE FROM _change_elem WHERE ' +
                     'table_name = ? AND id = ? AND ' +
-                    'change_time = (select MAX(change_time) FROM new_elem  ' +
+                    'change_time = (select MAX(change_time) FROM _change_elem  ' +
                     'WHERE table_name = ?  AND id = ?) ';
 
                 self._executeSql(sql, [tableName, reg[idName], tableName, reg[idName] ], tx,
                   () => {
                     self.dataObserver.next({table: tableName, record: reg, operation: DataOperation.Updated});
-                    callBack(tx);
+                    if (callBack && typeof callBack === 'function') { callBack(tx); }
                   },
                   (ts, error) => {
                     self._errorHandler(ts, error);
-                    callBack(tx, error);
+                    if (callBack && typeof callBack === 'function') { callBack(tx, error); }
                   });
             });
 
         } else {  // send conflict to server
-          callBack(tx);
+          if (callBack && typeof callBack === 'function') { callBack(tx); }
           self._sendConflict(tableName, idName, reg, tx);
         }
     });
@@ -529,7 +534,7 @@ export class DantiaSyncCliService {
     this.log(`There are ${nb} new or modified elements and ${nbDel} deleted, in the table ${table.tableName}to save in the local DB`);
     let counterNbElmTab = 0;
 
-    const callOperation = (tx: SqlTransaction, err: SqlError ) => {
+    const callOperation = (tx: SqlTransaction, err?: SqlError ) => {
       counterNbElmTab++;
       if (err) { sqlErrs.push(err); }
       if (counterNbElmTab === nb ) {
@@ -539,7 +544,7 @@ export class DantiaSyncCliService {
 
     this.db.transaction((tx: SqlTransaction) => {
       this._deleteTableLocalDb (table.tableName, table.idName, deleData, tx,  () => {
-        const listIdToCheck = [];
+        const listIdToCheck: string[] = [];
         if (nb !== 0) {
           for (let i = 0; i < nb; i++) {
               listIdToCheck.push(currData[i][table.idName]);
@@ -621,29 +626,29 @@ export class DantiaSyncCliService {
             const attValue = self._getMembersValue(reg, attList);
             if (!self.firstSync[tableName]) {
                 self._executeSql(sql, attValue, tx, () => {
-                    sql = 'DELETE FROM new_elem WHERE ' +
+                    sql = 'DELETE FROM _change_elem WHERE ' +
                         'table_name = ? AND id = ? AND ' +
-                        'change_time = (select MAX(change_time) FROM new_elem WHERE ' +
+                        'change_time = (select MAX(change_time) FROM _change_elem WHERE ' +
                         'table_name = ? AND id = ?) ';
 
                     self._executeSql(sql, [tableName, reg[idName], tableName, reg[idName]], tx,
                       () => {
                         this.dataObserver.next({table: tableName, record: reg, operation: DataOperation.Inserted});
-                        callBack (tx);
+                        if (callBack && typeof callBack === 'function') { callBack (tx); }
                       });
                 }, (ts, error) => {
                   self._errorHandler(ts, error);
-                  callBack(tx, error);
+                  if (callBack && typeof callBack === 'function') { callBack(tx, error); }
                 });
             } else {
                 self._executeSql(sql, attValue, tx,
                   () => {
                     this.dataObserver.next({table: tableName, record: reg, operation: DataOperation.Inserted});
-                    callBack (tx);
+                    if (callBack && typeof callBack === 'function') { callBack (tx); }
                   },
                   (ts, error) => {
                     self._errorHandler(ts, error);
-                    callBack(tx, error);
+                    if (callBack && typeof callBack === 'function') { callBack(tx, error); }
                 });
             }
         } else {  // send conflict to server
@@ -655,14 +660,12 @@ export class DantiaSyncCliService {
   private _sendConflict(tableName: string, idName: any, reg: object, tx: SqlTransaction): void {
     const self = this;
     let sql: string ;
+    const dataToSend: DataConflict = {};
 
     sql = 'select * FROM ' + tableName + ' WHERE ' + idName + ' = ?';
     self._selectSql(sql, [reg[idName]], tx, regloc => {
-        const dataToSend = {
-          info: self.syncInfo,
-          client: null,
-          server: null
-        };
+
+        dataToSend.info = self.syncInfo;
         if (regloc.length === 0) {
             dataToSend.client = 'DELETED';
         } else {
@@ -674,7 +677,7 @@ export class DantiaSyncCliService {
   }
 
   private _transformRs(rs: SqlResultSet): object[] {
-    const elms = [];
+    const elms: Object[] = [];
     if (typeof rs.rows === 'undefined') {
         return elms;
     }
@@ -693,7 +696,7 @@ export class DantiaSyncCliService {
   private _deleteTableLocalDb(tableName: string, idName: string, listIdToDelete: any[],
                               tx: SqlTransaction, callBack: (final: boolean) => void): void {
 
-    const listIds = [];
+    const listIds: any[] = [];
     let orden = 0;
     if (listIdToDelete.length === 0) {
       callBack(true);
@@ -725,7 +728,7 @@ export class DantiaSyncCliService {
 
     let  sql = `delete from ${tableName} WHERE ${idName} IN (${listIdToDelete.map(x => '?').join(',')})`;
     this._executeSql(sql, listIdToDelete, tx, () => {
-      sql = `delete from delete_elem WHERE table_name = "${tableName}" and id  IN (${listIdToDelete.map(x => '?').join(',')})`;
+      sql = `delete from _change_elem WHERE table_name = "${tableName}" and id  IN (${listIdToDelete.map(x => '?').join(',')})`;
       self._executeSql(sql, listIdToDelete, tx, () => {
         const reg = {};
         listIdToDelete.forEach( x => {
@@ -740,8 +743,8 @@ export class DantiaSyncCliService {
   private _getIdExitingInDB(tableName: string, idName: string, listIdToCheck: any[], tx: SqlTransaction,
                             dataCallBack: (IdExiting: any[]) => void): void {
 
-    const listIds = [];
-    let idsInDb = [];
+    const listIds: any[] = [];
+    let idsInDb: any[] = [];
     let orden = 0;
     if (listIdToCheck.length === 0) {
       dataCallBack([]);
@@ -880,7 +883,7 @@ export class DantiaSyncCliService {
                      callBack?: (result: object[] | any[]) => void): void {
     const self = this;
     this._executeSql(sql, params, optionalTransaction,
-      (tx, rs) => { callBack(self._transformRs(rs)); });
+      (tx, rs) => { if (callBack && typeof callBack === 'function') { callBack(self._transformRs(rs)); }});
   }
 
   private _errorHandler = (transaction: SqlTransaction, error: SqlError) => {
@@ -938,7 +941,7 @@ export class DantiaSyncCliService {
 
 
   private _getMembersValue(obj: object, members: string[]): any[] {
-    const memberArray = [];
+    const memberArray: any[] = [];
     members.forEach( member => {
       memberArray.push(obj[member]);
     });
@@ -1098,8 +1101,25 @@ export class DantiaSyncCliService {
     self._selectSql(sql, [], optionalTransaction, (rs) => { callback(rs[0]); });
   }
 
+  private _getListColumns(table: string, optionalTransaction, callback:(response: any[]) => void) {
+    const self = this;
+    self._getDDLTable(table, optionalTransaction, function(ddl) {
+      var regexlistColumns = /([A-Z0-9_]+\s+[A-Z0-9_]+\,)+/gi, regexColumns = /([A-Z0-9_]+)\s+([A-Z0-9_]+)\,/gi;
+      var listColumns = regexlistColumns.exec(ddl);
+      if (!listColumns) { throw new Error('regex: Imposible obtener la lista de campos.'); }
+      var result = [], match;
+      while ((match = regexColumns.exec(listColumns[0])) !== null) {
+        var column = match[1], type = match[2];
+        var quoted = false;
+        if (type.toLowerCase() === 'text') { quoted = true; }
+        result.push({ column: column, quoted: quoted });
+      }
+      callback(result);
+    });
+  }
+
   private checkModelsList(tableList: string[] | string): string[] {
-    let listToCheck = [];
+    let listToCheck: string[] = [];
     const tablesToSync = this.tablesToSync.map( t => t.tableName);
     if (tableList instanceof Array) {
       listToCheck = tableList;

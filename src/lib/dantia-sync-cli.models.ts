@@ -91,6 +91,12 @@ export interface DataToSync {
   delete_elem: object;
 }
 
+export interface DataConflict {
+  info: SyncInfo;
+  client: object | string;
+  server: object;
+}
+
 export interface ProgressData {
   message: string;
   percent: number;
