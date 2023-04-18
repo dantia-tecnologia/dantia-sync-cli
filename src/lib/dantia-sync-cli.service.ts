@@ -478,7 +478,7 @@ export class DantiaSyncCliService {
         sql = 'select DISTINCT id FROM _change_elem ' +
           ' WHERE table_name = ?  AND id = ? AND change_time > ? ';
 
-        self._selectSql(sql, [tableName, idValue, this.syncDate, tableName, idValue, this.syncDate], tx,
+        self._selectSql(sql, [tableName, idValue, this.syncDate], tx,
           (exists) => {
             if (exists.length) { callBack(true); } else { callBack(false); }
           });
