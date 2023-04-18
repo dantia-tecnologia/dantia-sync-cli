@@ -74,15 +74,15 @@ export class DantiaSyncCliService {
   }
 
   isPending(): Promise<boolean> {
-    if (this.isRunning()) {
-      return new Promise(resolve => {
-        setTimeout(() => true, 500);
-      });
-    } else {
-      return new Promise(resolve => {
-        this._selectSql('select count(*) from _change_elem', undefined, undefined, cont => { resolve(cont[0] > 0); } );
-      });
-    }
+    return new Promise(resolve => {
+      if (this.isRunning()) {
+          setTimeout(() => resolve(true), 500);
+      } else {
+        this._selectSql('select count(*) from _change_elem', undefined, undefined, cont => {
+          resolve(cont[0] > 0);
+        } );
+      }
+    });
   }
 
   getLastSyncDate(tableName?: string): number {

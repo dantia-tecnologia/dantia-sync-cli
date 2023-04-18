@@ -1,12 +1,12 @@
 {
-  "name": "dantia-sync-cli",
-  "version": "1.0.4",
-  "peerDependencies": {
-    "@angular/common": "^9.1.13",
-    "@angular/core": "^9.1.13"
-  },
-  "dependencies": {
-  	"tslib": "^1.10.0",
-    "db-wrapper": "*"
-  }
+    "name": "dantia-sync-cli",
+    "version": "1.0.6",
+    "peerDependencies": {
+        "@angular/common": "^9.1.13",
+        "@angular/core": "^9.1.13"
+    },
+    "dependencies": {
+        "tslib": "^1.10.0",
+        "db-wrapper": "*"
+    }
 }
