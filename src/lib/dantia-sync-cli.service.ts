@@ -66,7 +66,7 @@ export class DantiaSyncCliService {
   }
 
   isRunning(): boolean {
-    if (this.syncResult !== null) {
+    if (this.syncResult !== undefined) {
         return true;
     } else {
         return false;
