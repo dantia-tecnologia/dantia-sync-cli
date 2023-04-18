@@ -1,6 +1,6 @@
 {
     "name": "dantia-sync-cli",
-    "version": "1.0.6",
+    "version": "1.0.7",
     "peerDependencies": {
         "@angular/common": "^9.1.13",
         "@angular/core": "^9.1.13"
