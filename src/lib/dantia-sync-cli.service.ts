@@ -6,6 +6,21 @@ import { SqlTransaction, SqlResultSet, DataToSync, SqlError, DataFromServer, Pro
 import { Observable } from 'rxjs';
 import { share} from 'rxjs/operators';
 
+declare global {
+    interface String {
+      escapeSpecialChars(): string;
+    }
+}
+
+String.prototype.escapeSpecialChars = function() {
+  return this.replace(/\n/g, "\\n")
+  .replace(/\&/g, "\\&")
+  .replace(/\r/g, "\\r")
+  .replace(/\t/g, "\\t")
+  .replace(/\b/g, "")
+  .replace(/\f/g, "\\f");
+}
+
 @Injectable()
 export class DantiaSyncCliService {
   private db: any;
@@ -444,6 +459,7 @@ export class DantiaSyncCliService {
 
   private _getDataToSavDel(tableName: string, idName: string, needAllData: boolean, tx: SqlTransaction,
                            dataCallBack: (data: object[]) => void ): void {
+      const self = this;
       const operDeleteExists = [];
       const sql = 'select distinct op.oper TipoOper, op.id IdOper, op.data, op.change_time DateOper, c.* ' +
         'from ( select op.oper, op.id, max(op.change_time) change_time from  _change_elem op ' +
@@ -459,12 +475,18 @@ export class DantiaSyncCliService {
         var result = data.map(function (elem: any) {
           if (elem.TipoOper === 'D') { operDeleteExists.push(elem.IdOper);}
           if (elem.TipoOper === 'I' || elem.TipoOper === 'D') {
-            var data = JSON.parse(elem.data);
-            Object.keys(data).forEach(function (field) {
-              if (Object.getOwnPropertyDescriptor(elem,field)) {
-                elem[field] = data[field];
-              }
-            });
+            try {
+              var data = JSON.parse(elem.data.escapeSpecialChars());
+              Object.keys(data).forEach(function (field) {
+                if (Object.getOwnPropertyDescriptor(elem,field)) {
+                  elem[field] = data[field];
+                }
+              });                
+            } catch (error) {
+              self.error(error.message);
+              self.log(elem.data);
+              throw error;
+            }
           }
           delete elem.data;
           return elem;

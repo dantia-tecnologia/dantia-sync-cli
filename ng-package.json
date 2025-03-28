@@ -3,8 +3,5 @@
   "dest": "../../dist/dantia-sync-cli",
   "lib": {
     "entryFile": "src/public-api.ts"
-  },
-  "whitelistedNonPeerDependencies": [
-    "db-wrapper"
-  ]
+  }
 }
