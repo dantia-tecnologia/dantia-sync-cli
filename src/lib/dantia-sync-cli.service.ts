@@ -593,7 +593,7 @@ export class DantiaSyncCliService {
           });
         }
       } else {
-        this._finishSync(table.tableName, this.serverData.syncdate, tx);
+        this._finishSync(table.tableName, this.serverData.syncDate, tx);
       }
     }, (err) => {
       this.log(`TransactionError (${table.tableName}): ${err.message}`);
